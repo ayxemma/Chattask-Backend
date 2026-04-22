@@ -1,0 +1,8 @@
+{
+  "name": "chattask-backend",
+  "private": true,
+  "description": "FastAPI backend — install Python deps with pip, then use this start script or Procfile.",
+  "scripts": {
+    "start": "sh -c 'exec python -m uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-3000}'"
+  }
+}

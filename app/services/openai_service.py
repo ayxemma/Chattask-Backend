@@ -4,12 +4,15 @@ from typing import Optional
 
 import httpx
 
-from app.config import OPENAI_API_KEY
+from app.config import (
+    OPENAI_API_KEY,
+    OPENAI_BASE_URL,
+    OPENAI_PARSE_MODEL,
+    OPENAI_TRANSCRIBE_MODEL,
+)
 from app.models.parse_models import ParseResponse
 
 logger = logging.getLogger(__name__)
-
-OPENAI_BASE_URL = "https://api.openai.com/v1"
 
 PARSE_SYSTEM_PROMPT = """You are a task parsing assistant. Given a natural language task description, extract structured information and respond with a single JSON object — no explanation, no markdown, no extra text.
 
@@ -46,7 +49,7 @@ async def transcribe_audio(file_bytes: bytes, filename: str, content_type: str) 
             f"{OPENAI_BASE_URL}/audio/transcriptions",
             headers=headers,
             files={"file": (filename, file_bytes, content_type)},
-            data={"model": "gpt-4o-mini-transcribe"},
+            data={"model": OPENAI_TRANSCRIBE_MODEL},
         )
 
     if response.status_code != 200:
@@ -66,7 +69,7 @@ async def parse_task_text(text: str, now: str, timezone: str) -> ParseResponse:
     user_message = f'Parse this task:\n\nText: "{text}"\nCurrent time (ISO 8601): {now}\nTimezone: {timezone}'
 
     payload = {
-        "model": "gpt-4o-mini",
+        "model": OPENAI_PARSE_MODEL,
         "temperature": 0,
         "messages": [
             {"role": "system", "content": PARSE_SYSTEM_PROMPT},

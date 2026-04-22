@@ -23,8 +23,6 @@ async def parse(request: ParseRequest):
     if not request.text.strip():
         raise HTTPException(status_code=400, detail="'text' field must not be empty.")
 
-    logger.info("Parsing task text: '%s' (now=%s, tz=%s)", request.text, request.now, request.timezone)
-
     try:
         result = await parse_task_text(request.text, request.now, request.timezone)
     except ValueError as e:
@@ -33,5 +31,4 @@ async def parse(request: ParseRequest):
         logger.exception("Parse failed: %s", e)
         raise HTTPException(status_code=502, detail="Upstream parse service error.")
 
-    logger.info("Parse complete: action_type=%s, confidence=%.2f", result.action_type, result.confidence)
     return result

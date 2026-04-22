@@ -1,7 +1,6 @@
 import logging
 
-from fastapi import APIRouter, HTTPException, UploadFile, File
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, File, HTTPException, UploadFile
 
 from app.config import OPENAI_API_KEY
 from app.models.common import TranscribeResponse
@@ -10,18 +9,6 @@ from app.services.openai_service import transcribe_audio
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
-ALLOWED_AUDIO_TYPES = {
-    "audio/mpeg",
-    "audio/mp4",
-    "audio/wav",
-    "audio/x-wav",
-    "audio/webm",
-    "audio/ogg",
-    "audio/flac",
-    "audio/m4a",
-    "audio/x-m4a",
-}
 
 
 @router.post("/transcribe", response_model=TranscribeResponse)
@@ -49,8 +36,6 @@ async def transcribe(file: UploadFile = File(...)):
     if not file_bytes:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
-    logger.info("Transcribing file '%s' (%s, %d bytes)", file.filename, content_type, len(file_bytes))
-
     try:
         text = await transcribe_audio(file_bytes, file.filename, content_type)
     except ValueError as e:
@@ -59,5 +44,4 @@ async def transcribe(file: UploadFile = File(...)):
         logger.exception("Transcription failed: %s", e)
         raise HTTPException(status_code=502, detail="Upstream transcription service error.")
 
-    logger.info("Transcription complete: %d chars", len(text))
     return TranscribeResponse(text=text)
