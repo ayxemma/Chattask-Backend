@@ -1,7 +1,6 @@
 """Tests for POST /parse."""
 from unittest.mock import AsyncMock, patch
 
-import pytest
 from starlette.testclient import TestClient
 
 from app.models.parse_models import ParseResponse
@@ -52,9 +51,35 @@ def test_parse_calls_service_with_correct_args(client: TestClient):
         client.post("/parse", json=VALID_PAYLOAD)
 
     mock_fn.assert_awaited_once_with(
-        VALID_PAYLOAD["text"],
-        VALID_PAYLOAD["now"],
-        VALID_PAYLOAD["timezone"],
+        text=VALID_PAYLOAD["text"],
+        now=VALID_PAYLOAD["now"],
+        timezone=VALID_PAYLOAD["timezone"],
+        locale=None,
+        parse_instructions=None,
+        source=None,
+    )
+
+
+def test_parse_forwards_optional_client_context(client: TestClient):
+    """Optional JSON fields from iOS are passed into the OpenAI layer."""
+    payload = {
+        **VALID_PAYLOAD,
+        "locale": "en-US",
+        "parse_instructions": "Prefer reminders for short phrases.",
+        "request_id": "trace-1",
+        "source": "voice",
+    }
+    mock_fn = AsyncMock(return_value=MOCK_PARSE_RESPONSE)
+    with patch("app.routes.parse.parse_task_text", mock_fn):
+        response = client.post("/parse", json=payload)
+    assert response.status_code == 200
+    mock_fn.assert_awaited_once_with(
+        text=VALID_PAYLOAD["text"],
+        now=VALID_PAYLOAD["now"],
+        timezone=VALID_PAYLOAD["timezone"],
+        locale="en-US",
+        parse_instructions="Prefer reminders for short phrases.",
+        source="voice",
     )
 
 

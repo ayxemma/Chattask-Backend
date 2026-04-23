@@ -1,6 +1,7 @@
 import json
 import logging
-from typing import Optional
+import re
+from typing import Any, Optional
 
 import httpx
 
@@ -14,28 +15,130 @@ from app.models.parse_models import ParseResponse
 
 logger = logging.getLogger(__name__)
 
-PARSE_SYSTEM_PROMPT = """You are a task parsing assistant. Given a natural language task description, extract structured information and respond with a single JSON object — no explanation, no markdown, no extra text.
+# Canonical parse instructions for the ChatTask iOS client. Output keys use snake_case to match `LLMTaskParseResponse`.
+PARSE_SYSTEM_PROMPT = """You are a task parsing assistant for a productivity app. Given natural language (typed or transcribed speech), emit exactly one JSON object — no markdown, no explanation, no text outside the JSON.
 
-The JSON must have exactly these fields:
-- "action_type": one of "reminder", "task", or "event"
-- "title": short, clean title for the task (capitalize properly)
-- "notes": any extra detail not captured in the title, or null
-- "scheduled_at": ISO 8601 datetime with timezone offset if a time was mentioned, otherwise null
-- "confidence": float between 0.0 and 1.0 representing parse confidence
-- "language_code": ISO 639-1 language code of the input text (e.g. "en", "es", "zh")
+## Output schema (all keys required; use null where not applicable)
+- "action_type": string — one of the allowed values below (use these exact spellings).
+- "title": string or null — short, human-readable title; for edit commands may be empty or a short summary.
+- "notes": string or null — extra detail not in the title.
+- "scheduled_at": string or null — ISO 8601 datetime with timezone offset when a start/reminder/fire time applies; null if not applicable.
+- "end_at": string or null — ISO 8601 end instant for calendar-style blocks when the user gives a duration or explicit end; null otherwise.
+- "has_specific_time": boolean or null — true if the user expressed a concrete clock time or relative delay (e.g. "at 3pm", "in 20 minutes"); false for date-only phrasing (e.g. "tomorrow" with no time, all-day style); null only if there is no date/time at all.
+- "confidence": number or null — 0.0–1.0 parse confidence; null if unsure.
+- "language_code": string or null — ISO 639-1 (or best guess) for the input text.
+- "target_time": string or null — for edit commands only: ISO 8601 instant identifying which existing item to change (usually the task's current scheduled time the user refers to).
+- "new_scheduled_at": string or null — for rescheduleTask only: ISO 8601 new scheduled instant.
+- "append_text": string or null — for appendToTask only: text to add to notes (no need to repeat existing content).
 
-Rules:
-- Use the "now" field provided to resolve relative times (e.g. "at 6:15" → same day if in the future)
-- Use the "timezone" field to produce the correct UTC offset in "scheduled_at"
-- If no time is specified, set "scheduled_at" to null
-- Keep "title" concise and human-readable
-- Respond with valid JSON only"""
+## Allowed action_type values (exact strings)
+- "reminder": Time-based reminder / todo with a notify time. Use scheduled_at as the reminder fire time. Prefer this for simple to-dos, alarms, "remind me to…", and relative delays ("in 5 minutes…") when the user is not describing a calendar meeting/block.
+- "calendarEvent": Calendar entry with a definite time window. Use scheduled_at as start; set end_at when the user gives an end time or a duration you can convert to an end. Prefer for meetings, appointments, "block from X to Y", events with location/attendees flavor.
+- "unknown": Intent is ambiguous or unsupported; set minimal fields and low/null confidence.
+- "deleteTask": User wants to remove/cancel an existing item. Set target_time to the referenced schedule instant if inferable; title may briefly restate what to delete.
+- "rescheduleTask": User moves an existing item to a new time. Set target_time (old) and new_scheduled_at (new). Both should include timezone offsets consistent with the provided timezone.
+- "appendToTask": User adds a note to an existing item. Set target_time if inferable and append_text to the new fragment only.
+
+## Time rules
+- Use the "Current time" and "Timezone" from the user message to resolve relative phrases ("today", "tomorrow", "in 2 hours", "next Friday").
+- Always express scheduled_at, end_at, target_time, and new_scheduled_at with explicit timezone offsets (never zone-less local strings).
+- If no time is given and the phrase is purely informational, scheduled_at may be null and action_type may be unknown or reminder without a time depending on intent.
+- Speech transcripts may drop small words; tolerate ASR errors but do not invent specific times.
+
+## Title and notes
+- For short task phrases, keep the full wording in "title"; use null for "notes" when a single short phrase is enough.
+
+## ASR / transcription
+- Input may be speech: connectors like "in", "after", or "后" may be missing. Tolerate imperfect grammar; infer only missing glue words when intent is clear. Do not invent times when the phrase is genuinely ambiguous.
+
+## Duration-first phrases (relative to Current time)
+- If the text begins with a duration in minutes or hours, then states a task, treat as a relative-time "reminder" from Current time: set scheduled_at ≈ now + that duration, has_specific_time true, and put the task in title.
+
+Examples (scheduled_at relative to Current time):
+- "20 minutes, take a walk" → reminder; title reflects the walk; scheduled_at ≈ now+20m.
+- "five minutes call John" → reminder; title for calling John; scheduled_at ≈ now+5m.
+- "二十分钟去散步" → reminder; title e.g. 去散步; scheduled_at ≈ now+20m.
+- "两小时接孩子" → reminder; title e.g. 接孩子; scheduled_at ≈ now+2h.
+
+## Reminder vs calendarEvent
+- If the user describes something that sounds like a timed to-do or nudge, use reminder.
+- If they describe a scheduled block, meeting, or explicit start/end window, use calendarEvent.
+
+Respond with valid JSON only matching the schema."""
 
 
 def _auth_headers() -> dict[str, str]:
     if not OPENAI_API_KEY:
         raise ValueError("OPENAI_API_KEY is not set")
     return {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+
+
+def _normalize_action_type(raw: Optional[Any]) -> str:
+    """Map model output to iOS ActionType raw strings (camelCase)."""
+    if raw is None:
+        return "unknown"
+    s = str(raw).strip()
+    if not s:
+        return "unknown"
+    collapsed = re.sub(r"[_\s]+", "", s).lower()
+    # Keys are underscore/space-insensitive forms; values match Swift `ActionType` rawValues.
+    to_canonical = {
+        "reminder": "reminder",
+        "unknown": "unknown",
+        "calendarevent": "calendarEvent",
+        "event": "calendarEvent",
+        "task": "reminder",
+        "todo": "reminder",
+        "deletetask": "deleteTask",
+        "rescheduletask": "rescheduleTask",
+        "appendtotask": "appendToTask",
+    }
+    return to_canonical.get(collapsed, "unknown")
+
+
+def _coerce_optional_str(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    if isinstance(v, str):
+        t = v.strip()
+        return t if t else None
+    return str(v)
+
+
+def _coerce_optional_bool(v: Any) -> Optional[bool]:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    return None
+
+
+def _coerce_optional_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_response_from_llm_dict(data: dict[str, Any]) -> ParseResponse:
+    """Build ParseResponse from raw JSON object; tolerate minor type drift from the model."""
+    return ParseResponse(
+        action_type=_normalize_action_type(data.get("action_type")),
+        title=_coerce_optional_str(data.get("title")),
+        notes=_coerce_optional_str(data.get("notes")),
+        scheduled_at=_coerce_optional_str(data.get("scheduled_at")),
+        end_at=_coerce_optional_str(data.get("end_at")),
+        has_specific_time=_coerce_optional_bool(data.get("has_specific_time")),
+        language_code=_coerce_optional_str(data.get("language_code")),
+        confidence=_coerce_optional_float(data.get("confidence")),
+        target_time=_coerce_optional_str(data.get("target_time")),
+        new_scheduled_at=_coerce_optional_str(data.get("new_scheduled_at")),
+        append_text=_coerce_optional_str(data.get("append_text")),
+    )
 
 
 async def transcribe_audio(file_bytes: bytes, filename: str, content_type: str) -> str:
@@ -60,19 +163,44 @@ async def transcribe_audio(file_bytes: bytes, filename: str, content_type: str) 
     return result.get("text", "")
 
 
-async def parse_task_text(text: str, now: str, timezone: str) -> ParseResponse:
+async def parse_task_text(
+    *,
+    text: str,
+    now: str,
+    timezone: str,
+    locale: Optional[str] = None,
+    parse_instructions: Optional[str] = None,
+    source: Optional[str] = None,
+) -> ParseResponse:
     """
-    Send task text to OpenAI chat completions and return a structured ParseResponse.
+    Send task text to OpenAI chat completions and return structured ParseResponse (iOS contract).
     """
     headers = {**_auth_headers(), "Content-Type": "application/json"}
 
-    user_message = f'Parse this task:\n\nText: "{text}"\nCurrent time (ISO 8601): {now}\nTimezone: {timezone}'
+    system_content = PARSE_SYSTEM_PROMPT
+    if parse_instructions and parse_instructions.strip():
+        # Client hints are additive; the block above remains authoritative.
+        system_content = (
+            f"{PARSE_SYSTEM_PROMPT}\n\n---\nClient parsing hints (follow when consistent with rules above):\n"
+            f"{parse_instructions.strip()}"
+        )
+
+    user_lines = [
+        f'Parse this task:\n\nText: "{text}"',
+        f"Current time (ISO 8601): {now}",
+        f"Timezone (IANA): {timezone}",
+    ]
+    if locale:
+        user_lines.append(f"Locale: {locale}")
+    if source:
+        user_lines.append(f"Input source: {source}")
+    user_message = "\n".join(user_lines)
 
     payload = {
         "model": OPENAI_PARSE_MODEL,
         "temperature": 0,
         "messages": [
-            {"role": "system", "content": PARSE_SYSTEM_PROMPT},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": user_message},
         ],
         "response_format": {"type": "json_object"},
@@ -97,4 +225,7 @@ async def parse_task_text(text: str, now: str, timezone: str) -> ParseResponse:
         logger.error("Failed to decode OpenAI JSON response: %s\nRaw: %s", e, raw_content)
         raise ValueError(f"Model returned invalid JSON: {e}") from e
 
-    return ParseResponse(**data)
+    if not isinstance(data, dict):
+        raise ValueError("Model returned JSON that is not an object")
+
+    return _parse_response_from_llm_dict(data)

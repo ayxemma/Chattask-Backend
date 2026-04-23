@@ -23,8 +23,18 @@ async def parse(request: ParseRequest):
     if not request.text.strip():
         raise HTTPException(status_code=400, detail="'text' field must not be empty.")
 
+    if request.request_id:
+        logger.info("parse request_id=%s", request.request_id)
+
     try:
-        result = await parse_task_text(request.text, request.now, request.timezone)
+        result = await parse_task_text(
+            text=request.text,
+            now=request.now,
+            timezone=request.timezone,
+            locale=request.locale,
+            parse_instructions=request.parse_instructions,
+            source=request.source,
+        )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
