@@ -57,6 +57,10 @@ def test_parse_calls_service_with_correct_args(client: TestClient):
         locale=None,
         parse_instructions=None,
         source=None,
+        last_active_task_id=None,
+        active_task_title=None,
+        active_task_scheduled_at=None,
+        active_task_notes=None,
     )
 
 
@@ -110,6 +114,36 @@ def test_parse_forwards_optional_client_context(client: TestClient):
         locale="en-US",
         parse_instructions="Prefer reminders for short phrases.",
         source="voice",
+        last_active_task_id=None,
+        active_task_title=None,
+        active_task_scheduled_at=None,
+        active_task_notes=None,
+    )
+
+
+def test_parse_forwards_active_task_snapshot(client: TestClient):
+    payload = {
+        **VALID_PAYLOAD,
+        "last_active_task_id": "550e8400-e29b-41d4-a716-446655440000",
+        "active_task_title": "Cook dinner",
+        "active_task_scheduled_at": "2026-04-16T18:00:00-04:00",
+        "active_task_notes": "salt",
+    }
+    mock_fn = AsyncMock(return_value=MOCK_PARSE_RESPONSE)
+    with patch("app.routes.parse.parse_task_text", mock_fn):
+        response = client.post("/parse", json=payload)
+    assert response.status_code == 200
+    mock_fn.assert_awaited_once_with(
+        text=VALID_PAYLOAD["text"],
+        now=VALID_PAYLOAD["now"],
+        timezone=VALID_PAYLOAD["timezone"],
+        locale=None,
+        parse_instructions=None,
+        source=None,
+        last_active_task_id="550e8400-e29b-41d4-a716-446655440000",
+        active_task_title="Cook dinner",
+        active_task_scheduled_at="2026-04-16T18:00:00-04:00",
+        active_task_notes="salt",
     )
 
 

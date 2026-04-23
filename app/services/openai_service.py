@@ -30,6 +30,7 @@ PARSE_SYSTEM_PROMPT = """You are a task parsing assistant for a productivity app
 - "target_time": string or null — for edit commands only: ISO 8601 instant identifying which existing item to change (usually the task's current scheduled time the user refers to).
 - "new_scheduled_at": string or null — for rescheduleTask only: ISO 8601 new scheduled instant.
 - "append_text": string or null — for appendToTask only: text to add to notes (no need to repeat existing content).
+- "new_title": string or null — for updateTaskTitle only: the new task title.
 
 ## Allowed action_type values (exact strings)
 - "reminder": Time-based reminder / todo with a notify time. Use scheduled_at as the reminder fire time. Prefer this for simple to-dos, alarms, "remind me to…", and relative delays ("in 5 minutes…") when the user is not describing a calendar meeting/block.
@@ -38,6 +39,12 @@ PARSE_SYSTEM_PROMPT = """You are a task parsing assistant for a productivity app
 - "deleteTask": User wants to remove/cancel an existing item. Set target_time to the referenced schedule instant if inferable; title may briefly restate what to delete.
 - "rescheduleTask": User moves an existing item to a new time. Set target_time (old) and new_scheduled_at (new). Both should include timezone offsets consistent with the provided timezone.
 - "appendToTask": User adds a note to an existing item. Set target_time if inferable and append_text to the new fragment only.
+- "updateTaskTitle": User renames the task. Set new_title to the full new title; target_time may be the active task's scheduled instant when disambiguating.
+
+## Follow-up vs new task (when "Active task context" appears in the user message)
+- The client may send a snapshot of the task the user just created or edited. The user may follow up with short commands: "delete that", "make it tomorrow", "also add …", "change the title to …", "30 minutes instead", etc. Prefer resolving these against that active task when the wording clearly refers to it (pronouns, "that", "this task", incremental edits).
+- If the message is clearly a **new standalone** task (different subject and intent, e.g. first message was "remind me to cook dinner at 6" and the next is "buy milk tomorrow"), emit a **create** action (reminder or calendarEvent) with no edit action_type — do not bind to the previous task.
+- When using an edit action and the active task has a scheduled time, set target_time to that instant (with offset) if the user did not specify another time anchor.
 
 ## Time rules
 - Use the "Current time" and "Timezone" from the user message to resolve relative phrases ("today", "tomorrow", "in 2 hours", "next Friday").
@@ -92,6 +99,9 @@ def _normalize_action_type(raw: Optional[Any]) -> str:
         "deletetask": "deleteTask",
         "rescheduletask": "rescheduleTask",
         "appendtotask": "appendToTask",
+        "updatetasktitle": "updateTaskTitle",
+        "renametask": "updateTaskTitle",
+        "edittitle": "updateTaskTitle",
     }
     return to_canonical.get(collapsed, "unknown")
 
@@ -138,6 +148,7 @@ def _parse_response_from_llm_dict(data: dict[str, Any]) -> ParseResponse:
         target_time=_coerce_optional_str(data.get("target_time")),
         new_scheduled_at=_coerce_optional_str(data.get("new_scheduled_at")),
         append_text=_coerce_optional_str(data.get("append_text")),
+        new_title=_coerce_optional_str(data.get("new_title")),
     )
 
 
@@ -163,6 +174,15 @@ async def transcribe_audio(file_bytes: bytes, filename: str, content_type: str) 
     return result.get("text", "")
 
 
+def _truncate_notes(s: Optional[str], max_len: int = 1200) -> Optional[str]:
+    if s is None:
+        return None
+    t = s.strip()
+    if len(t) <= max_len:
+        return t
+    return t[: max_len - 1] + "…"
+
+
 async def parse_task_text(
     *,
     text: str,
@@ -171,6 +191,10 @@ async def parse_task_text(
     locale: Optional[str] = None,
     parse_instructions: Optional[str] = None,
     source: Optional[str] = None,
+    last_active_task_id: Optional[str] = None,
+    active_task_title: Optional[str] = None,
+    active_task_scheduled_at: Optional[str] = None,
+    active_task_notes: Optional[str] = None,
 ) -> ParseResponse:
     """
     Send task text to OpenAI chat completions and return structured ParseResponse (iOS contract).
@@ -194,6 +218,17 @@ async def parse_task_text(
         user_lines.append(f"Locale: {locale}")
     if source:
         user_lines.append(f"Input source: {source}")
+    if last_active_task_id and str(last_active_task_id).strip():
+        user_lines.append("")
+        user_lines.append("Active task context (for follow-up commands; user may refer to this task without naming it):")
+        user_lines.append(f"- task_id: {last_active_task_id.strip()}")
+        if active_task_title:
+            user_lines.append(f'- title: "{active_task_title.strip()}"')
+        if active_task_scheduled_at:
+            user_lines.append(f"- scheduled_at (ISO 8601): {active_task_scheduled_at.strip()}")
+        notes_ctx = _truncate_notes(active_task_notes)
+        if notes_ctx:
+            user_lines.append(f"- notes (may be truncated): {notes_ctx}")
     user_message = "\n".join(user_lines)
 
     payload = {

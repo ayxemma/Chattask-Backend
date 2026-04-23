@@ -34,6 +34,10 @@ async def parse(request: ParseRequest):
             locale=request.locale,
             parse_instructions=request.parse_instructions,
             source=request.source,
+            last_active_task_id=request.last_active_task_id,
+            active_task_title=request.active_task_title,
+            active_task_scheduled_at=request.active_task_scheduled_at,
+            active_task_notes=request.active_task_notes,
         )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))

@@ -21,6 +21,12 @@ class ParseRequest(BaseModel):
         description='e.g. "typed" | "voice" — may appear in user message for disambiguation',
     )
 
+    # Chat follow-up: most recently created/edited task while the sheet is open (client snapshot).
+    last_active_task_id: Optional[str] = None
+    active_task_title: Optional[str] = None
+    active_task_scheduled_at: Optional[str] = None
+    active_task_notes: Optional[str] = None
+
 
 class ParseResponse(BaseModel):
     """JSON returned to iOS — field names match `LLMTaskParseResponse` CodingKeys (snake_case)."""
@@ -38,3 +44,4 @@ class ParseResponse(BaseModel):
     target_time: Optional[str] = None
     new_scheduled_at: Optional[str] = None
     append_text: Optional[str] = None
+    new_title: Optional[str] = None
