@@ -60,6 +60,36 @@ def test_parse_calls_service_with_correct_args(client: TestClient):
     )
 
 
+def test_parse_returns_full_response_when_service_populates_all_fields(client: TestClient):
+    """HTTP JSON exposes the full iOS-facing parse contract when values are set."""
+    full = ParseResponse(
+        action_type="rescheduleTask",
+        title="Move meeting",
+        notes="optional",
+        scheduled_at="2026-04-16T10:00:00-04:00",
+        end_at="2026-04-16T11:00:00-04:00",
+        has_specific_time=True,
+        language_code="en",
+        confidence=0.88,
+        target_time="2026-04-16T09:00:00-04:00",
+        new_scheduled_at="2026-04-16T15:00:00-04:00",
+        append_text=None,
+    )
+    with patch("app.routes.parse.parse_task_text", new_callable=AsyncMock, return_value=full):
+        response = client.post("/parse", json=VALID_PAYLOAD)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["action_type"] == "rescheduleTask"
+    assert data["title"] == "Move meeting"
+    assert data["scheduled_at"] == "2026-04-16T10:00:00-04:00"
+    assert data["end_at"] == "2026-04-16T11:00:00-04:00"
+    assert data["has_specific_time"] is True
+    assert data["target_time"] == "2026-04-16T09:00:00-04:00"
+    assert data["new_scheduled_at"] == "2026-04-16T15:00:00-04:00"
+    assert data["language_code"] == "en"
+    assert data["confidence"] == 0.88
+
+
 def test_parse_forwards_optional_client_context(client: TestClient):
     """Optional JSON fields from iOS are passed into the OpenAI layer."""
     payload = {
