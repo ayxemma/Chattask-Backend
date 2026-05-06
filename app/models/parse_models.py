@@ -45,3 +45,5 @@ class ParseResponse(BaseModel):
     new_scheduled_at: Optional[str] = None
     append_text: Optional[str] = None
     new_title: Optional[str] = None
+    target_reference_type: Optional[str] = None
+    target_task_id: Optional[str] = None

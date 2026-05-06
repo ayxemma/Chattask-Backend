@@ -31,6 +31,8 @@ PARSE_SYSTEM_PROMPT = """You are a task parsing assistant for a productivity app
 - "new_scheduled_at": string or null — for rescheduleTask only: ISO 8601 new scheduled instant.
 - "append_text": string or null — for appendToTask only: text to add to notes (no need to repeat existing content).
 - "new_title": string or null — for updateTaskTitle only: the new task title.
+- "target_reference_type": string or null — for edit/follow-up commands: "task_id", "recent_task", "time", or "title".
+- "target_task_id": string or null — exact active task_id when target_reference_type is "task_id" or "recent_task".
 
 ## Allowed action_type values (exact strings)
 - "reminder": Time-based reminder / todo with a notify time. Use scheduled_at as the reminder fire time. Prefer this for simple to-dos, alarms, "remind me to…", and relative delays ("in 5 minutes…") when the user is not describing a calendar meeting/block.
@@ -42,7 +44,10 @@ PARSE_SYSTEM_PROMPT = """You are a task parsing assistant for a productivity app
 - "updateTaskTitle": User renames the task. Set new_title to the full new title; target_time may be the active task's scheduled instant when disambiguating.
 
 ## Follow-up vs new task (when "Active task context" appears in the user message)
-- The client may send a snapshot of the task the user just created or edited. The user may follow up with short commands: "delete that", "make it tomorrow", "also add …", "change the title to …", "30 minutes instead", etc. Prefer resolving these against that active task when the wording clearly refers to it (pronouns, "that", "this task", incremental edits).
+- The client may send a snapshot of the task the user just created or edited. Treat that active task as the primary target before any global time/title matching.
+- The user may follow up with short commands: "delete that", "make it tomorrow", "also add …", "after that …", "after I wake up …", "change the title to …", "30 minutes instead", "睡醒之后…", "之后…", "也…", "再…", etc. Prefer resolving these against that active task when the wording is a continuation, pronoun, sequence, or incremental edit.
+- If a follow-up adds related detail without explicitly creating a separate reminder, emit "appendToTask" and set append_text to the new fragment. Example: active task "睡二十分钟"; text "睡醒了之后给艾瑞准备酸奶。" -> appendToTask, append_text "睡醒了之后给艾瑞准备酸奶。", target_reference_type "recent_task", target_task_id active task_id.
+- For edit actions resolved to the active task, set target_reference_type to "recent_task" and target_task_id to the active task_id. Do not use unrelated existing tasks or inferred times for the target.
 - If the message is clearly a **new standalone** task (different subject and intent, e.g. first message was "remind me to cook dinner at 6" and the next is "buy milk tomorrow"), emit a **create** action (reminder or calendarEvent) with no edit action_type — do not bind to the previous task.
 - When using an edit action and the active task has a scheduled time, set target_time to that instant (with offset) if the user did not specify another time anchor.
 
@@ -149,6 +154,8 @@ def _parse_response_from_llm_dict(data: dict[str, Any]) -> ParseResponse:
         new_scheduled_at=_coerce_optional_str(data.get("new_scheduled_at")),
         append_text=_coerce_optional_str(data.get("append_text")),
         new_title=_coerce_optional_str(data.get("new_title")),
+        target_reference_type=_coerce_optional_str(data.get("target_reference_type")),
+        target_task_id=_coerce_optional_str(data.get("target_task_id")),
     )
 
 
@@ -222,6 +229,8 @@ async def parse_task_text(
         user_lines.append("")
         user_lines.append("Active task context (for follow-up commands; user may refer to this task without naming it):")
         user_lines.append(f"- task_id: {last_active_task_id.strip()}")
+        user_lines.append('- target_reference_type to use for active-task follow-ups: "recent_task"')
+        user_lines.append(f"- target_task_id to use for active-task follow-ups: {last_active_task_id.strip()}")
         if active_task_title:
             user_lines.append(f'- title: "{active_task_title.strip()}"')
         if active_task_scheduled_at:
