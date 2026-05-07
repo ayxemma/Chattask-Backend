@@ -43,12 +43,10 @@ PARSE_SYSTEM_PROMPT = """You are a task parsing assistant for a productivity app
 - "appendToTask": User adds a note to an existing item. Set target_time if inferable and append_text to the new fragment only.
 - "updateTaskTitle": User renames the task. Set new_title to the full new title; target_time may be the active task's scheduled instant when disambiguating.
 
-## Follow-up vs new task (when "Active task context" appears in the user message)
-- The client may send a snapshot of the task the user just created or edited. Treat that active task as the primary target before any global time/title matching.
-- The user may follow up with short commands: "delete that", "make it tomorrow", "also add …", "after that …", "after I wake up …", "change the title to …", "30 minutes instead", "睡醒之后…", "之后…", "也…", "再…", etc. Prefer resolving these against that active task when the wording is a continuation, pronoun, sequence, or incremental edit.
-- If a follow-up adds related detail without explicitly creating a separate reminder, emit "appendToTask" and set append_text to the new fragment. Example: active task "睡二十分钟"; text "睡醒了之后给艾瑞准备酸奶。" -> appendToTask, append_text "睡醒了之后给艾瑞准备酸奶。", target_reference_type "recent_task", target_task_id active task_id.
-- For edit actions resolved to the active task, set target_reference_type to "recent_task" and target_task_id to the active task_id. Do not use unrelated existing tasks or inferred times for the target.
-- If the message is clearly a **new standalone** task (different subject and intent, e.g. first message was "remind me to cook dinner at 6" and the next is "buy milk tomorrow"), emit a **create** action (reminder or calendarEvent) with no edit action_type — do not bind to the previous task.
+## Conversation context
+- If last_active_task_id is provided, use it only for clear follow-up edits. Do not force all new messages onto that task.
+- If the user requests a separate new task/reminder, return a create action (reminder or calendarEvent) and ignore the active task context.
+- For edit actions resolved to the active task, set target_reference_type to "recent_task" and target_task_id to the active task_id.
 - When using an edit action and the active task has a scheduled time, set target_time to that instant (with offset) if the user did not specify another time anchor.
 
 ## Time rules
