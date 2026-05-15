@@ -61,6 +61,7 @@ def test_parse_calls_service_with_correct_args(client: TestClient):
         active_task_title=None,
         active_task_scheduled_at=None,
         active_task_notes=None,
+        active_task_recurrence=None,
     )
 
 
@@ -75,9 +76,19 @@ def test_parse_returns_full_response_when_service_populates_all_fields(client: T
         has_specific_time=True,
         language_code="en",
         confidence=0.88,
+        recurrence={
+            "frequency": "weekly",
+            "weekdays": [1, 2, 3, 4, 5],
+            "time": "11:50",
+            "timezone": "America/New_York",
+        },
         target_time="2026-04-16T09:00:00-04:00",
         new_scheduled_at="2026-04-16T15:00:00-04:00",
         append_text=None,
+        recurrence_update={
+            "operation": "remove_weekdays",
+            "weekdays": [4],
+        },
     )
     with patch("app.routes.parse.parse_task_text", new_callable=AsyncMock, return_value=full):
         response = client.post("/parse", json=VALID_PAYLOAD)
@@ -92,6 +103,10 @@ def test_parse_returns_full_response_when_service_populates_all_fields(client: T
     assert data["new_scheduled_at"] == "2026-04-16T15:00:00-04:00"
     assert data["language_code"] == "en"
     assert data["confidence"] == 0.88
+    assert data["recurrence"]["frequency"] == "weekly"
+    assert data["recurrence"]["weekdays"] == [1, 2, 3, 4, 5]
+    assert data["recurrence_update"]["operation"] == "remove_weekdays"
+    assert data["recurrence_update"]["weekdays"] == [4]
 
 
 def test_parse_forwards_optional_client_context(client: TestClient):
@@ -118,6 +133,7 @@ def test_parse_forwards_optional_client_context(client: TestClient):
         active_task_title=None,
         active_task_scheduled_at=None,
         active_task_notes=None,
+        active_task_recurrence=None,
     )
 
 
@@ -128,6 +144,12 @@ def test_parse_forwards_active_task_snapshot(client: TestClient):
         "active_task_title": "Cook dinner",
         "active_task_scheduled_at": "2026-04-16T18:00:00-04:00",
         "active_task_notes": "salt",
+        "active_task_recurrence": {
+            "frequency": "weekly",
+            "weekdays": [1, 2, 3, 4, 5],
+            "time": "11:50",
+            "timezone": "America/New_York",
+        },
     }
     mock_fn = AsyncMock(return_value=MOCK_PARSE_RESPONSE)
     with patch("app.routes.parse.parse_task_text", mock_fn):
@@ -144,6 +166,12 @@ def test_parse_forwards_active_task_snapshot(client: TestClient):
         active_task_title="Cook dinner",
         active_task_scheduled_at="2026-04-16T18:00:00-04:00",
         active_task_notes="salt",
+        active_task_recurrence={
+            "frequency": "weekly",
+            "weekdays": [1, 2, 3, 4, 5],
+            "time": "11:50",
+            "timezone": "America/New_York",
+        },
     )
 
 

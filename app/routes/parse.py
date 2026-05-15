@@ -38,6 +38,11 @@ async def parse(request: ParseRequest):
             active_task_title=request.active_task_title,
             active_task_scheduled_at=request.active_task_scheduled_at,
             active_task_notes=request.active_task_notes,
+            active_task_recurrence=(
+                request.active_task_recurrence.model_dump(exclude_none=True)
+                if request.active_task_recurrence
+                else None
+            ),
         )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))

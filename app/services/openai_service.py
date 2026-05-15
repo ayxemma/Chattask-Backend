@@ -27,12 +27,14 @@ PARSE_SYSTEM_PROMPT = """You are a task parsing assistant for a productivity app
 - "has_specific_time": boolean or null — true if the user expressed a concrete clock time or relative delay (e.g. "at 3pm", "in 20 minutes"); false for date-only phrasing (e.g. "tomorrow" with no time, all-day style); null only if there is no date/time at all.
 - "confidence": number or null — 0.0–1.0 parse confidence; null if unsure.
 - "language_code": string or null — ISO 639-1 (or best guess) for the input text.
+- "recurrence": object or null — weekly recurrence metadata for recurring creates. Shape: {"frequency":"weekly","weekdays":[1..7],"time":"HH:mm","timezone":"IANA zone","start_date":"YYYY-MM-DD or ISO datetime","end_date":null or date}. Use ISO weekdays where Monday=1 and Sunday=7.
 - "target_time": string or null — for edit commands only: ISO 8601 instant identifying which existing item to change (usually the task's current scheduled time the user refers to).
 - "new_scheduled_at": string or null — for rescheduleTask only: ISO 8601 new scheduled instant.
 - "append_text": string or null — for appendToTask only: text to add to notes (no need to repeat existing content).
 - "new_title": string or null — for updateTaskTitle only: the new task title.
 - "target_reference_type": string or null — for edit/follow-up commands: "task_id", "recent_task", "time", or "title".
 - "target_task_id": string or null — exact active task_id when target_reference_type is "task_id" or "recent_task".
+- "recurrence_update": object or null — for updateRecurrence only. Shape: {"operation":"set_weekdays|add_weekdays|remove_weekdays|set_time|clear_recurrence","weekdays":[1..7] or null,"time":"HH:mm" or null,"timezone":"IANA zone" or null,"start_date":null,"end_date":null}.
 
 ## Allowed action_type values (exact strings)
 - "reminder": Time-based reminder / todo with a notify time. Use scheduled_at as the reminder fire time. Prefer this for simple to-dos, alarms, "remind me to…", and relative delays ("in 5 minutes…") when the user is not describing a calendar meeting/block.
@@ -42,12 +44,14 @@ PARSE_SYSTEM_PROMPT = """You are a task parsing assistant for a productivity app
 - "rescheduleTask": User moves an existing item to a new time. Set target_time (old) and new_scheduled_at (new). Both should include timezone offsets consistent with the provided timezone.
 - "appendToTask": User adds a note to an existing item. Set target_time if inferable and append_text to the new fragment only.
 - "updateTaskTitle": User renames the task. Set new_title to the full new title; target_time may be the active task's scheduled instant when disambiguating.
+- "updateRecurrence": User changes recurrence for an existing item. Set recurrence_update and target_reference_type/target_task_id when using active context.
 
 ## Conversation context
 - If last_active_task_id is provided, use it only for clear follow-up edits. Do not force all new messages onto that task.
 - If the user requests a separate new task/reminder, return a create action (reminder or calendarEvent) and ignore the active task context.
 - For edit actions resolved to the active task, set target_reference_type to "recent_task" and target_task_id to the active task_id.
 - When using an edit action and the active task has a scheduled time, set target_time to that instant (with offset) if the user did not specify another time anchor.
+- If active recurrence context is provided, use it to interpret recurrence follow-ups such as removing a weekday.
 
 ## Time rules
 - Use the "Current time" and "Timezone" from the user message to resolve relative phrases ("today", "tomorrow", "in 2 hours", "next Friday").
@@ -69,6 +73,11 @@ Examples (scheduled_at relative to Current time):
 - "five minutes call John" → reminder; title for calling John; scheduled_at ≈ now+5m.
 - "二十分钟去散步" → reminder; title e.g. 去散步; scheduled_at ≈ now+20m.
 - "两小时接孩子" → reminder; title e.g. 接孩子; scheduled_at ≈ now+2h.
+
+## Recurrence
+- Support weekly recurrence phrases including Chinese weekday ranges. Example: "每周一到周五 11:50 提醒我去接阿瑞" means recurrence.frequency="weekly", recurrence.weekdays=[1,2,3,4,5], recurrence.time="11:50", and title="去接阿瑞".
+- For recurring creates, also set scheduled_at to the next occurrence datetime so older clients can still create a one-off reminder.
+- Do not place recurrence words such as "每周一到周五" in the title.
 
 ## Reminder vs calendarEvent
 - If the user describes something that sounds like a timed to-do or nudge, use reminder.
@@ -105,6 +114,9 @@ def _normalize_action_type(raw: Optional[Any]) -> str:
         "updatetasktitle": "updateTaskTitle",
         "renametask": "updateTaskTitle",
         "edittitle": "updateTaskTitle",
+        "updaterecurrence": "updateRecurrence",
+        "editrecurrence": "updateRecurrence",
+        "changerecurrence": "updateRecurrence",
     }
     return to_canonical.get(collapsed, "unknown")
 
@@ -137,6 +149,48 @@ def _coerce_optional_float(v: Any) -> Optional[float]:
         return None
 
 
+def _sanitize_weekdays(v: Any) -> Optional[list[int]]:
+    if not isinstance(v, list):
+        return None
+    days: list[int] = []
+    for item in v:
+        try:
+            day = int(item)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= day <= 7 and day not in days:
+            days.append(day)
+    return sorted(days) if days else None
+
+
+def _coerce_recurrence(v: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(v, dict):
+        return None
+    recurrence = {
+        "frequency": _coerce_optional_str(v.get("frequency")),
+        "weekdays": _sanitize_weekdays(v.get("weekdays")),
+        "time": _coerce_optional_str(v.get("time")),
+        "timezone": _coerce_optional_str(v.get("timezone")),
+        "start_date": _coerce_optional_str(v.get("start_date")),
+        "end_date": _coerce_optional_str(v.get("end_date")),
+    }
+    return recurrence if any(value is not None for value in recurrence.values()) else None
+
+
+def _coerce_recurrence_update(v: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(v, dict):
+        return None
+    update = {
+        "operation": _coerce_optional_str(v.get("operation")),
+        "weekdays": _sanitize_weekdays(v.get("weekdays")),
+        "time": _coerce_optional_str(v.get("time")),
+        "timezone": _coerce_optional_str(v.get("timezone")),
+        "start_date": _coerce_optional_str(v.get("start_date")),
+        "end_date": _coerce_optional_str(v.get("end_date")),
+    }
+    return update if any(value is not None for value in update.values()) else None
+
+
 def _parse_response_from_llm_dict(data: dict[str, Any]) -> ParseResponse:
     """Build ParseResponse from raw JSON object; tolerate minor type drift from the model."""
     return ParseResponse(
@@ -148,12 +202,14 @@ def _parse_response_from_llm_dict(data: dict[str, Any]) -> ParseResponse:
         has_specific_time=_coerce_optional_bool(data.get("has_specific_time")),
         language_code=_coerce_optional_str(data.get("language_code")),
         confidence=_coerce_optional_float(data.get("confidence")),
+        recurrence=_coerce_recurrence(data.get("recurrence")),
         target_time=_coerce_optional_str(data.get("target_time")),
         new_scheduled_at=_coerce_optional_str(data.get("new_scheduled_at")),
         append_text=_coerce_optional_str(data.get("append_text")),
         new_title=_coerce_optional_str(data.get("new_title")),
         target_reference_type=_coerce_optional_str(data.get("target_reference_type")),
         target_task_id=_coerce_optional_str(data.get("target_task_id")),
+        recurrence_update=_coerce_recurrence_update(data.get("recurrence_update")),
     )
 
 
@@ -200,6 +256,7 @@ async def parse_task_text(
     active_task_title: Optional[str] = None,
     active_task_scheduled_at: Optional[str] = None,
     active_task_notes: Optional[str] = None,
+    active_task_recurrence: Optional[dict[str, Any]] = None,
 ) -> ParseResponse:
     """
     Send task text to OpenAI chat completions and return structured ParseResponse (iOS contract).
@@ -233,6 +290,8 @@ async def parse_task_text(
             user_lines.append(f'- title: "{active_task_title.strip()}"')
         if active_task_scheduled_at:
             user_lines.append(f"- scheduled_at (ISO 8601): {active_task_scheduled_at.strip()}")
+        if active_task_recurrence:
+            user_lines.append(f"- recurrence: {json.dumps(active_task_recurrence, ensure_ascii=False)}")
         notes_ctx = _truncate_notes(active_task_notes)
         if notes_ctx:
             user_lines.append(f"- notes (may be truncated): {notes_ctx}")

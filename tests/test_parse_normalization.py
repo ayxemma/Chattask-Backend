@@ -17,6 +17,7 @@ def test_normalize_action_type_maps_legacy_and_variants():
     assert _normalize_action_type("append_to_task") == "appendToTask"
     assert _normalize_action_type("update_task_title") == "updateTaskTitle"
     assert _normalize_action_type("rename_task") == "updateTaskTitle"
+    assert _normalize_action_type("update_recurrence") == "updateRecurrence"
 
 
 def test_parse_response_from_llm_dict_normalizes_and_coerces():
@@ -27,6 +28,16 @@ def test_parse_response_from_llm_dict_normalizes_and_coerces():
             "confidence": "0.75",
             "has_specific_time": 1,
             "scheduled_at": "2026-04-16T18:15:00-04:00",
+            "recurrence": {
+                "frequency": " weekly ",
+                "weekdays": [5, 1, "bad", 3, 3, 8],
+                "time": " 11:50 ",
+                "timezone": " America/New_York ",
+            },
+            "recurrence_update": {
+                "operation": " remove_weekdays ",
+                "weekdays": [4],
+            },
             "target_time": None,
         }
     )
@@ -35,6 +46,13 @@ def test_parse_response_from_llm_dict_normalizes_and_coerces():
     assert r.confidence == 0.75
     assert r.has_specific_time is True
     assert r.scheduled_at == "2026-04-16T18:15:00-04:00"
+    assert r.recurrence is not None
+    assert r.recurrence.frequency == "weekly"
+    assert r.recurrence.weekdays == [1, 3, 5]
+    assert r.recurrence.time == "11:50"
+    assert r.recurrence_update is not None
+    assert r.recurrence_update.operation == "remove_weekdays"
+    assert r.recurrence_update.weekdays == [4]
 
 
 def test_parse_response_includes_new_title():
