@@ -78,6 +78,10 @@ Examples (scheduled_at relative to Current time):
 - Support weekly recurrence phrases including Chinese weekday ranges. Example: "每周一到周五 11:50 提醒我去接阿瑞" means recurrence.frequency="weekly", recurrence.weekdays=[1,2,3,4,5], recurrence.time="11:50", and title="去接阿瑞".
 - For recurring creates, also set scheduled_at to the next occurrence datetime so older clients can still create a one-off reminder.
 - Do not place recurrence words such as "每周一到周五" in the title.
+- For active recurring-task follow-up edits:
+  - "把周四去掉" means action_type="updateRecurrence", target_reference_type="recent_task", target_task_id=last_active_task_id, recurrence_update.operation="remove_weekdays", recurrence_update.weekdays=[4].
+  - "改成周一到周三" means action_type="updateRecurrence", target_reference_type="recent_task", target_task_id=last_active_task_id, recurrence_update.operation="set_weekdays", recurrence_update.weekdays=[1,2,3].
+  - "不要周五提醒了" means action_type="updateRecurrence", target_reference_type="recent_task", target_task_id=last_active_task_id, recurrence_update.operation="remove_weekdays", recurrence_update.weekdays=[5].
 
 ## Reminder vs calendarEvent
 - If the user describes something that sounds like a timed to-do or nudge, use reminder.
