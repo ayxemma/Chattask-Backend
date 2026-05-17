@@ -115,3 +115,76 @@ class TaskTargetResolveResponse(BaseModel):
     confidence: float = 0.0
     reason: Optional[str] = None
     candidates: Optional[list[str]] = None
+
+
+class CommandInterpretActiveTask(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    title: str
+    scheduled_at: Optional[str] = None
+    is_recurring: bool = False
+    recurrence_label: Optional[str] = None
+
+
+class CommandInterpretRequest(BaseModel):
+    """POST /interpret-command body — one-shot command + edit target interpretation."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    text: str
+    now: str
+    timezone: str
+    locale: Optional[str] = None
+    active_task: Optional[CommandInterpretActiveTask] = None
+    candidate_tasks: list[TaskTargetCandidate] = []
+    request_id: Optional[str] = None
+
+
+class CommandInterpretTarget(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    resolution: Optional[str] = None
+    selected_task_id: Optional[str] = None
+    selected_task_title: Optional[str] = None
+    candidate_ids: Optional[list[str]] = None
+    reason: Optional[str] = None
+
+
+class CommandInterpretCreate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    title: Optional[str] = None
+    notes: Optional[str] = None
+    scheduled_at: Optional[str] = None
+    end_at: Optional[str] = None
+    has_specific_time: Optional[bool] = None
+    recurrence_type: Optional[str] = None
+    recurrence_weekdays: Optional[list[int]] = None
+    recurrence_end_at: Optional[str] = None
+
+
+class CommandInterpretEdit(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    new_title: Optional[str] = None
+    new_scheduled_at: Optional[str] = None
+    append_text: Optional[str] = None
+    new_recurrence_type: Optional[str] = None
+    new_recurrence_weekdays: Optional[list[int]] = None
+    apply_scope: Optional[str] = None
+
+
+class CommandInterpretResponse(BaseModel):
+    """Structured one-shot command interpretation returned to iOS."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    action_type: Optional[str] = None
+    confidence: float = 0.0
+    requires_confirmation: bool = False
+    confirmation_kind: Optional[str] = None
+    assistant_message: Optional[str] = None
+    target: Optional[CommandInterpretTarget] = None
+    create: Optional[CommandInterpretCreate] = None
+    edit: Optional[CommandInterpretEdit] = None

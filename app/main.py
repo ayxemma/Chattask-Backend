@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from starlette.middleware.cors import CORSMiddleware
 
 from app.config import cors_allow_origins, validate_config
-from app.routes import parse, resolve_task_target, transcribe
+from app.routes import interpret_command, parse, resolve_task_target, transcribe
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,6 +49,7 @@ app.add_middleware(
 app.include_router(transcribe.router)
 app.include_router(parse.router)
 app.include_router(resolve_task_target.router)
+app.include_router(interpret_command.router)
 
 
 @app.get("/health", tags=["health"])
