@@ -11,7 +11,7 @@ from app.config import (
     OPENAI_PARSE_MODEL,
     OPENAI_TRANSCRIBE_MODEL,
 )
-from app.models.parse_models import ParseResponse
+from app.models.parse_models import ParseResponse, TaskTargetResolveResponse
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +88,32 @@ Examples (scheduled_at relative to Current time):
 - If they describe a scheduled block, meeting, or explicit start/end window, use calendarEvent.
 
 Respond with valid JSON only matching the schema."""
+
+
+TASK_TARGET_RESOLVER_PROMPT = """You are selecting which existing task the user wants to edit/delete/reschedule.
+Choose from candidates only. Do not invent tasks.
+
+Return exactly one JSON object with:
+- "resolution": "resolved" | "needs_confirmation" | "ambiguous" | "no_match"
+- "selected_id": candidate id or null
+- "confidence": number from 0.0 to 1.0
+- "reason": short explanation
+- "candidates": array of candidate ids for ambiguous choices, or null
+
+Rules:
+- If user says "this", "it", "这个", "這個", "它" and active_task_id is provided, prefer the active task.
+- If user names a task title, choose the candidate with the closest semantic/title match.
+- Understand Chinese speech recognition variants and near-homophones.
+- Understand partial references: "接阿里" may refer to "去接阿瑞".
+- Use target_time and candidate scheduled_at/recurrence_label when provided.
+- Use recurrence info if the user mentions repeat/weekly/weekday language.
+- Never return "resolved" unless reasonably confident.
+- Use "needs_confirmation" for a likely candidate with medium confidence.
+- Use "ambiguous" when multiple candidates are plausible; return the best 2-3 ids in candidates.
+- Use "no_match" if no provided candidate fits.
+- selected_id and candidates must only contain ids from the provided candidates.
+
+Respond with valid JSON only."""
 
 
 def _auth_headers() -> dict[str, str]:
@@ -217,6 +243,60 @@ def _parse_response_from_llm_dict(data: dict[str, Any]) -> ParseResponse:
     )
 
 
+def _coerce_resolution(raw: Optional[Any]) -> str:
+    if raw is None:
+        return "no_match"
+    s = str(raw).strip().lower()
+    mapping = {
+        "resolved": "resolved",
+        "needsconfirmation": "needs_confirmation",
+        "needs_confirmation": "needs_confirmation",
+        "confirm": "needs_confirmation",
+        "confirmation": "needs_confirmation",
+        "ambiguous": "ambiguous",
+        "disambiguate": "ambiguous",
+        "no_match": "no_match",
+        "nomatch": "no_match",
+        "none": "no_match",
+    }
+    return mapping.get(re.sub(r"[\s-]+", "_", s), mapping.get(re.sub(r"[_\s-]+", "", s), "no_match"))
+
+
+def _parse_task_target_resolution(data: dict[str, Any], allowed_ids: set[str]) -> TaskTargetResolveResponse:
+    resolution = _coerce_resolution(data.get("resolution"))
+    selected_id = _coerce_optional_str(data.get("selected_id"))
+    if selected_id not in allowed_ids:
+        selected_id = None
+
+    candidate_ids: list[str] = []
+    raw_candidates = data.get("candidates")
+    if isinstance(raw_candidates, list):
+        for item in raw_candidates:
+            cid = _coerce_optional_str(item)
+            if cid in allowed_ids and cid not in candidate_ids:
+                candidate_ids.append(cid)
+
+    confidence = _coerce_optional_float(data.get("confidence")) or 0.0
+    confidence = max(0.0, min(1.0, confidence))
+    reason = _coerce_optional_str(data.get("reason"))
+
+    if resolution in {"resolved", "needs_confirmation"} and not selected_id:
+        resolution = "no_match"
+    if resolution == "ambiguous" and not candidate_ids:
+        if selected_id:
+            resolution = "needs_confirmation"
+        else:
+            resolution = "no_match"
+
+    return TaskTargetResolveResponse(
+        resolution=resolution,
+        selected_id=selected_id,
+        confidence=confidence,
+        reason=reason,
+        candidates=candidate_ids or None,
+    )
+
+
 async def transcribe_audio(file_bytes: bytes, filename: str, content_type: str) -> str:
     """
     Send audio bytes to OpenAI's audio transcription endpoint and return the transcript text.
@@ -334,3 +414,65 @@ async def parse_task_text(
         raise ValueError("Model returned JSON that is not an object")
 
     return _parse_response_from_llm_dict(data)
+
+
+async def resolve_task_target(
+    *,
+    user_text: str,
+    action_type: str,
+    target_title: Optional[str],
+    target_time: Optional[str],
+    candidates: list[dict[str, Any]],
+    active_task_id: Optional[str],
+    timezone: str,
+    locale: Optional[str] = None,
+) -> TaskTargetResolveResponse:
+    """Ask the model to choose an edit target from a provided candidate list only."""
+    headers = {**_auth_headers(), "Content-Type": "application/json"}
+    allowed_ids = {str(candidate.get("id")) for candidate in candidates if candidate.get("id")}
+    if not allowed_ids:
+        return TaskTargetResolveResponse(resolution="no_match", confidence=0.0, reason="no candidates")
+
+    user_payload = {
+        "user_text": user_text,
+        "action_type": action_type,
+        "target_title": target_title,
+        "target_time": target_time,
+        "candidates": candidates,
+        "active_task_id": active_task_id,
+        "timezone": timezone,
+        "locale": locale,
+    }
+
+    payload = {
+        "model": OPENAI_PARSE_MODEL,
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": TASK_TARGET_RESOLVER_PROMPT},
+            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+        ],
+        "response_format": {"type": "json_object"},
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            f"{OPENAI_BASE_URL}/chat/completions",
+            headers=headers,
+            json=payload,
+        )
+
+    if response.status_code != 200:
+        logger.error("OpenAI task target resolver error %s: %s", response.status_code, response.text)
+        response.raise_for_status()
+
+    raw_content = response.json()["choices"][0]["message"]["content"]
+    try:
+        data = json.loads(raw_content)
+    except json.JSONDecodeError as e:
+        logger.error("Failed to decode task target resolver JSON: %s\nRaw: %s", e, raw_content)
+        raise ValueError(f"Model returned invalid JSON: {e}") from e
+
+    if not isinstance(data, dict):
+        raise ValueError("Model returned JSON that is not an object")
+
+    return _parse_task_target_resolution(data, allowed_ids)

@@ -76,3 +76,42 @@ class ParseResponse(BaseModel):
     target_reference_type: Optional[str] = None
     target_task_id: Optional[str] = None
     recurrence_update: Optional[RecurrenceUpdate] = None
+
+
+class TaskTargetCandidate(BaseModel):
+    """Existing task snapshot sent by iOS for LLM-assisted edit-target resolution."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    title: str
+    scheduled_at: Optional[str] = None
+    is_recurring: bool = False
+    recurrence_label: Optional[str] = None
+
+
+class TaskTargetResolveRequest(BaseModel):
+    """POST /resolve-task-target body."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    user_text: str
+    action_type: str
+    target_title: Optional[str] = None
+    target_time: Optional[str] = None
+    candidates: list[TaskTargetCandidate]
+    active_task_id: Optional[str] = None
+    timezone: str
+    locale: Optional[str] = None
+
+
+class TaskTargetResolveResponse(BaseModel):
+    """Candidate-only task target resolution response."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    resolution: str
+    selected_id: Optional[str] = None
+    confidence: float = 0.0
+    reason: Optional[str] = None
+    candidates: Optional[list[str]] = None
