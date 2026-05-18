@@ -28,6 +28,7 @@ PARSE_SYSTEM_PROMPT = """You are a task parsing assistant for a productivity app
 - "confidence": number or null — 0.0–1.0 parse confidence; null if unsure.
 - "language_code": string or null — ISO 639-1 (or best guess) for the input text.
 - "recurrence": object or null — weekly recurrence metadata for recurring creates. Shape: {"frequency":"weekly","weekdays":[1..7],"time":"HH:mm","timezone":"IANA zone","start_date":"YYYY-MM-DD or ISO datetime","end_date":null or date}. Use ISO weekdays where Monday=1 and Sunday=7.
+- "alert_style": "silent" | "default" | "important" | null — user-facing reminder alert importance style.
 - "target_time": string or null — for edit commands only: ISO 8601 instant identifying which existing item to change (usually the task's current scheduled time the user refers to).
 - "new_scheduled_at": string or null — for rescheduleTask only: ISO 8601 new scheduled instant.
 - "append_text": string or null — for appendToTask only: text to add to notes (no need to repeat existing content).
@@ -45,6 +46,7 @@ PARSE_SYSTEM_PROMPT = """You are a task parsing assistant for a productivity app
 - "appendToTask": User adds a note to an existing item. Set target_time if inferable and append_text to the new fragment only.
 - "updateTaskTitle": User renames the task. Set new_title to the full new title; target_time may be the active task's scheduled instant when disambiguating.
 - "updateRecurrence": User changes recurrence for an existing item. Set recurrence_update and target_reference_type/target_task_id when using active context.
+- "updateAlertStyle": User changes an existing task's reminder alert style. Set alert_style and target_reference_type/target_task_id when using active context.
 
 ## Conversation context
 - If last_active_task_id is provided, use it only for clear follow-up edits. Do not force all new messages onto that task.
@@ -82,6 +84,15 @@ Examples (scheduled_at relative to Current time):
   - "把周四去掉" means action_type="updateRecurrence", target_reference_type="recent_task", target_task_id=last_active_task_id, recurrence_update.operation="remove_weekdays", recurrence_update.weekdays=[4].
   - "改成周一到周三" means action_type="updateRecurrence", target_reference_type="recent_task", target_task_id=last_active_task_id, recurrence_update.operation="set_weekdays", recurrence_update.weekdays=[1,2,3].
   - "不要周五提醒了" means action_type="updateRecurrence", target_reference_type="recent_task", target_task_id=last_active_task_id, recurrence_update.operation="remove_weekdays", recurrence_update.weekdays=[5].
+
+## Alert style
+- Support simple product-facing reminder alert styles only: "silent", "default", "important".
+- Do not describe this as a true alarm, Critical Alert, or something that bypasses Silent Mode or Focus.
+- Map 静音 / silent / no sound / 不要声音提醒 to alert_style="silent".
+- Map normal / default / 普通提醒 to alert_style="default".
+- Map important / loud / alarm-like / 重要提醒 / 明显一点 / 声音大一点 to alert_style="important".
+- For creates, set alert_style when the user specifies one; otherwise null.
+- For existing task edits such as "把这个任务改成重要提醒", use action_type="updateAlertStyle" and set alert_style.
 
 ## Reminder vs calendarEvent
 - If the user describes something that sounds like a timed to-do or nudge, use reminder.
@@ -122,7 +133,7 @@ Return exactly one JSON object matching the schema below. No markdown.
 
 Schema:
 {
-  "action_type": "createReminder" | "createEvent" | "rescheduleTask" | "renameTask" | "appendToTask" | "deleteTask" | "updateRecurrence" | "unknown",
+  "action_type": "createReminder" | "createEvent" | "rescheduleTask" | "renameTask" | "appendToTask" | "deleteTask" | "updateRecurrence" | "updateAlertStyle" | "unknown",
   "confidence": 0.0,
   "requires_confirmation": true,
   "confirmation_kind": "none" | "confirm_action" | "choose_candidate" | "clarify",
@@ -142,7 +153,8 @@ Schema:
     "has_specific_time": null,
     "recurrence_type": "none",
     "recurrence_weekdays": null,
-    "recurrence_end_at": null
+    "recurrence_end_at": null,
+    "alert_style": null
   },
   "edit": {
     "new_title": null,
@@ -150,6 +162,7 @@ Schema:
     "append_text": null,
     "new_recurrence_type": null,
     "new_recurrence_weekdays": null,
+    "alert_style": null,
     "apply_scope": "single"
   }
 }
@@ -171,6 +184,10 @@ Rules:
 - If required fields are missing or intent is unclear, action_type="unknown", confirmation_kind="clarify".
 - Delete should usually require confirmation unless confidence is very high and active_task was explicitly referenced.
 - For weekly recurrence creates, set create.recurrence_type="weekly" and ISO weekdays Monday=1...Sunday=7.
+- For alert style, use only "silent", "default", or "important". Map 静音/silent/no sound/不要声音提醒 to "silent"; normal/default/普通提醒 to "default"; important/loud/alarm-like/重要提醒/明显一点/声音大一点 to "important".
+- For create commands, put alert style in create.alert_style when specified.
+- For existing task alert edits such as "把这个任务改成重要提醒", use action_type="updateAlertStyle" and put the value in edit.alert_style.
+- Do not call Important a true alarm or imply it can bypass Silent Mode or Focus.
 - Always resolve relative times from Current time and Timezone. Use ISO 8601 datetimes with timezone offset.
 
 Respond with valid JSON only."""
@@ -207,6 +224,10 @@ def _normalize_action_type(raw: Optional[Any]) -> str:
         "updaterecurrence": "updateRecurrence",
         "editrecurrence": "updateRecurrence",
         "changerecurrence": "updateRecurrence",
+        "updatealertstyle": "updateAlertStyle",
+        "editalertstyle": "updateAlertStyle",
+        "changealertstyle": "updateAlertStyle",
+        "setalertstyle": "updateAlertStyle",
     }
     return to_canonical.get(collapsed, "unknown")
 
@@ -237,6 +258,36 @@ def _coerce_optional_float(v: Any) -> Optional[float]:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _coerce_alert_style(v: Any) -> Optional[str]:
+    raw = _coerce_optional_str(v)
+    if not raw:
+        return None
+    collapsed = re.sub(r"[_\s-]+", "", raw).lower()
+    mapping = {
+        "silent": "silent",
+        "quiet": "silent",
+        "nosound": "silent",
+        "mute": "silent",
+        "muted": "silent",
+        "静音": "silent",
+        "不要声音": "silent",
+        "default": "default",
+        "normal": "default",
+        "standard": "default",
+        "普通": "default",
+        "普通提醒": "default",
+        "important": "important",
+        "loud": "important",
+        "strong": "important",
+        "alarmlike": "important",
+        "重要": "important",
+        "重要提醒": "important",
+        "明显一点": "important",
+        "声音大一点": "important",
+    }
+    return mapping.get(collapsed)
 
 
 def _sanitize_weekdays(v: Any) -> Optional[list[int]]:
@@ -293,6 +344,7 @@ def _parse_response_from_llm_dict(data: dict[str, Any]) -> ParseResponse:
         language_code=_coerce_optional_str(data.get("language_code")),
         confidence=_coerce_optional_float(data.get("confidence")),
         recurrence=_coerce_recurrence(data.get("recurrence")),
+        alert_style=_coerce_alert_style(data.get("alert_style")),
         target_time=_coerce_optional_str(data.get("target_time")),
         new_scheduled_at=_coerce_optional_str(data.get("new_scheduled_at")),
         append_text=_coerce_optional_str(data.get("append_text")),
@@ -372,6 +424,10 @@ def _normalize_interpret_action(raw: Optional[Any]) -> str:
         "appendtotask": "appendToTask",
         "deletetask": "deleteTask",
         "updaterecurrence": "updateRecurrence",
+        "updatealertstyle": "updateAlertStyle",
+        "editalertstyle": "updateAlertStyle",
+        "changealertstyle": "updateAlertStyle",
+        "setalertstyle": "updateAlertStyle",
         "unknown": "unknown",
     }
     return mapping.get(collapsed, "unknown")
@@ -399,6 +455,11 @@ def _sanitize_interpret_response(data: dict[str, Any], allowed_ids: set[str], ac
         response.action_type = "rescheduleTask"
     if response.action_type == "rescheduleTask" and response.edit:
         response.edit.new_title = None
+
+    if response.create:
+        response.create.alert_style = _coerce_alert_style(response.create.alert_style)
+    if response.edit:
+        response.edit.alert_style = _coerce_alert_style(response.edit.alert_style)
 
     if response.confirmation_kind is None:
         response.confirmation_kind = "none" if not response.requires_confirmation else "confirm_action"

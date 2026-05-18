@@ -69,6 +69,7 @@ class ParseResponse(BaseModel):
     language_code: Optional[str] = None
     confidence: Optional[float] = None
     recurrence: Optional[RecurrenceSpec] = None
+    alert_style: Optional[str] = None
     target_time: Optional[str] = None
     new_scheduled_at: Optional[str] = None
     append_text: Optional[str] = None
@@ -162,6 +163,7 @@ class CommandInterpretCreate(BaseModel):
     recurrence_type: Optional[str] = None
     recurrence_weekdays: Optional[list[int]] = None
     recurrence_end_at: Optional[str] = None
+    alert_style: Optional[str] = None
 
 
 class CommandInterpretEdit(BaseModel):
@@ -172,6 +174,7 @@ class CommandInterpretEdit(BaseModel):
     append_text: Optional[str] = None
     new_recurrence_type: Optional[str] = None
     new_recurrence_weekdays: Optional[list[int]] = None
+    alert_style: Optional[str] = None
     apply_scope: Optional[str] = None
 
 
