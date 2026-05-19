@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException
 
 from app.config import OPENAI_API_KEY
 from app.models.parse_models import ParseRequest, ParseResponse
-from app.services.openai_service import parse_task_text
+from app.services.task_parser_service import parse_task_text
 
 logger = logging.getLogger(__name__)
 

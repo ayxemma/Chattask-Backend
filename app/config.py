@@ -31,6 +31,19 @@ OPENAI_PARSE_MODEL: str = (
 )
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+USE_SGLANG_PARSER: bool = _env_bool("USE_SGLANG_PARSER", default=False)
+SGLANG_BASE_URL: Optional[str] = _strip_or_none(os.getenv("SGLANG_BASE_URL"))
+SGLANG_API_KEY: Optional[str] = _strip_or_none(os.getenv("SGLANG_API_KEY"))
+SGLANG_MODEL: Optional[str] = _strip_or_none(os.getenv("SGLANG_MODEL"))
+
+
 def cors_allow_origins() -> List[str]:
     """Origins allowed for browser CORS. Empty list means no cross-origin browser access."""
     raw = os.getenv("CORS_ORIGIN", "").strip()

@@ -11,94 +11,20 @@ from app.config import (
     OPENAI_PARSE_MODEL,
     OPENAI_TRANSCRIBE_MODEL,
 )
-from app.models.parse_models import CommandInterpretResponse, ParseResponse, TaskTargetResolveResponse
+from app.llm_clients.parse_normalization import (
+    coerce_alert_style,
+    coerce_optional_float,
+    coerce_optional_str,
+    normalize_action_type,
+    parse_response_from_llm_dict,
+)
+from app.models.parse_models import CommandInterpretResponse, TaskTargetResolveResponse
 
 logger = logging.getLogger(__name__)
 
-# Canonical parse instructions for the ChatTask iOS client. Output keys use snake_case to match `LLMTaskParseResponse`.
-PARSE_SYSTEM_PROMPT = """You are a task parsing assistant for a productivity app. Given natural language (typed or transcribed speech), emit exactly one JSON object — no markdown, no explanation, no text outside the JSON.
-
-## Output schema (all keys required; use null where not applicable)
-- "action_type": string — one of the allowed values below (use these exact spellings).
-- "title": string or null — short, human-readable title; for edit commands may be empty or a short summary.
-- "notes": string or null — extra detail not in the title.
-- "scheduled_at": string or null — ISO 8601 datetime with timezone offset when a start/reminder/fire time applies; null if not applicable.
-- "end_at": string or null — ISO 8601 end instant for calendar-style blocks when the user gives a duration or explicit end; null otherwise.
-- "has_specific_time": boolean or null — true if the user expressed a concrete clock time or relative delay (e.g. "at 3pm", "in 20 minutes"); false for date-only phrasing (e.g. "tomorrow" with no time, all-day style); null only if there is no date/time at all.
-- "confidence": number or null — 0.0–1.0 parse confidence; null if unsure.
-- "language_code": string or null — ISO 639-1 (or best guess) for the input text.
-- "recurrence": object or null — weekly recurrence metadata for recurring creates. Shape: {"frequency":"weekly","weekdays":[1..7],"time":"HH:mm","timezone":"IANA zone","start_date":"YYYY-MM-DD or ISO datetime","end_date":null or date}. Use ISO weekdays where Monday=1 and Sunday=7.
-- "alert_style": "silent" | "default" | "important" | null — user-facing reminder alert importance style.
-- "target_time": string or null — for edit commands only: ISO 8601 instant identifying which existing item to change (usually the task's current scheduled time the user refers to).
-- "new_scheduled_at": string or null — for rescheduleTask only: ISO 8601 new scheduled instant.
-- "append_text": string or null — for appendToTask only: text to add to notes (no need to repeat existing content).
-- "new_title": string or null — for updateTaskTitle only: the new task title.
-- "target_reference_type": string or null — for edit/follow-up commands: "task_id", "recent_task", "time", or "title".
-- "target_task_id": string or null — exact active task_id when target_reference_type is "task_id" or "recent_task".
-- "recurrence_update": object or null — for updateRecurrence only. Shape: {"operation":"set_weekdays|add_weekdays|remove_weekdays|set_time|clear_recurrence","weekdays":[1..7] or null,"time":"HH:mm" or null,"timezone":"IANA zone" or null,"start_date":null,"end_date":null}.
-
-## Allowed action_type values (exact strings)
-- "reminder": Time-based reminder / todo with a notify time. Use scheduled_at as the reminder fire time. Prefer this for simple to-dos, alarms, "remind me to…", and relative delays ("in 5 minutes…") when the user is not describing a calendar meeting/block.
-- "calendarEvent": Calendar entry with a definite time window. Use scheduled_at as start; set end_at when the user gives an end time or a duration you can convert to an end. Prefer for meetings, appointments, "block from X to Y", events with location/attendees flavor.
-- "unknown": Intent is ambiguous or unsupported; set minimal fields and low/null confidence.
-- "deleteTask": User wants to remove/cancel an existing item. Set target_time to the referenced schedule instant if inferable; title may briefly restate what to delete.
-- "rescheduleTask": User moves an existing item to a new time. Set target_time (old) and new_scheduled_at (new). Both should include timezone offsets consistent with the provided timezone.
-- "appendToTask": User adds a note to an existing item. Set target_time if inferable and append_text to the new fragment only.
-- "updateTaskTitle": User renames the task. Set new_title to the full new title; target_time may be the active task's scheduled instant when disambiguating.
-- "updateRecurrence": User changes recurrence for an existing item. Set recurrence_update and target_reference_type/target_task_id when using active context.
-- "updateAlertStyle": User changes an existing task's reminder alert style. Set alert_style and target_reference_type/target_task_id when using active context.
-
-## Conversation context
-- If last_active_task_id is provided, use it only for clear follow-up edits. Do not force all new messages onto that task.
-- If the user requests a separate new task/reminder, return a create action (reminder or calendarEvent) and ignore the active task context.
-- For edit actions resolved to the active task, set target_reference_type to "recent_task" and target_task_id to the active task_id.
-- When using an edit action and the active task has a scheduled time, set target_time to that instant (with offset) if the user did not specify another time anchor.
-- If active recurrence context is provided, use it to interpret recurrence follow-ups such as removing a weekday.
-
-## Time rules
-- Use the "Current time" and "Timezone" from the user message to resolve relative phrases ("today", "tomorrow", "in 2 hours", "next Friday").
-- Always express scheduled_at, end_at, target_time, and new_scheduled_at with explicit timezone offsets (never zone-less local strings).
-- If no time is given and the phrase is purely informational, scheduled_at may be null and action_type may be unknown or reminder without a time depending on intent.
-- Speech transcripts may drop small words; tolerate ASR errors but do not invent specific times.
-
-## Title and notes
-- For short task phrases, keep the full wording in "title"; use null for "notes" when a single short phrase is enough.
-
-## ASR / transcription
-- Input may be speech: connectors like "in", "after", or "后" may be missing. Tolerate imperfect grammar; infer only missing glue words when intent is clear. Do not invent times when the phrase is genuinely ambiguous.
-
-## Duration-first phrases (relative to Current time)
-- If the text begins with a duration in minutes or hours, then states a task, treat as a relative-time "reminder" from Current time: set scheduled_at ≈ now + that duration, has_specific_time true, and put the task in title.
-
-Examples (scheduled_at relative to Current time):
-- "20 minutes, take a walk" → reminder; title reflects the walk; scheduled_at ≈ now+20m.
-- "five minutes call John" → reminder; title for calling John; scheduled_at ≈ now+5m.
-- "二十分钟去散步" → reminder; title e.g. 去散步; scheduled_at ≈ now+20m.
-- "两小时接孩子" → reminder; title e.g. 接孩子; scheduled_at ≈ now+2h.
-
-## Recurrence
-- Support weekly recurrence phrases including Chinese weekday ranges. Example: "每周一到周五 11:50 提醒我去接阿瑞" means recurrence.frequency="weekly", recurrence.weekdays=[1,2,3,4,5], recurrence.time="11:50", and title="去接阿瑞".
-- For recurring creates, also set scheduled_at to the next occurrence datetime so older clients can still create a one-off reminder.
-- Do not place recurrence words such as "每周一到周五" in the title.
-- For active recurring-task follow-up edits:
-  - "把周四去掉" means action_type="updateRecurrence", target_reference_type="recent_task", target_task_id=last_active_task_id, recurrence_update.operation="remove_weekdays", recurrence_update.weekdays=[4].
-  - "改成周一到周三" means action_type="updateRecurrence", target_reference_type="recent_task", target_task_id=last_active_task_id, recurrence_update.operation="set_weekdays", recurrence_update.weekdays=[1,2,3].
-  - "不要周五提醒了" means action_type="updateRecurrence", target_reference_type="recent_task", target_task_id=last_active_task_id, recurrence_update.operation="remove_weekdays", recurrence_update.weekdays=[5].
-
-## Alert style
-- Support simple product-facing reminder alert styles only: "silent", "default", "important".
-- Do not describe this as a true alarm, Critical Alert, or something that bypasses Silent Mode or Focus.
-- Map 静音 / silent / no sound / 不要声音提醒 to alert_style="silent".
-- Map normal / default / 普通提醒 to alert_style="default".
-- Map important / loud / alarm-like / 重要提醒 / 明显一点 / 声音大一点 to alert_style="important".
-- For creates, set alert_style when the user specifies one; otherwise null.
-- For existing task edits such as "把这个任务改成重要提醒", use action_type="updateAlertStyle" and set alert_style.
-
-## Reminder vs calendarEvent
-- If the user describes something that sounds like a timed to-do or nudge, use reminder.
-- If they describe a scheduled block, meeting, or explicit start/end window, use calendarEvent.
-
-Respond with valid JSON only matching the schema."""
+# Backward-compatible aliases for tests.
+_normalize_action_type = normalize_action_type
+_parse_response_from_llm_dict = parse_response_from_llm_dict
 
 
 TASK_TARGET_RESOLVER_PROMPT = """You are selecting which existing task the user wants to edit/delete/reschedule.
@@ -199,162 +125,6 @@ def _auth_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {OPENAI_API_KEY}"}
 
 
-def _normalize_action_type(raw: Optional[Any]) -> str:
-    """Map model output to iOS ActionType raw strings (camelCase)."""
-    if raw is None:
-        return "unknown"
-    s = str(raw).strip()
-    if not s:
-        return "unknown"
-    collapsed = re.sub(r"[_\s]+", "", s).lower()
-    # Keys are underscore/space-insensitive forms; values match Swift `ActionType` rawValues.
-    to_canonical = {
-        "reminder": "reminder",
-        "unknown": "unknown",
-        "calendarevent": "calendarEvent",
-        "event": "calendarEvent",
-        "task": "reminder",
-        "todo": "reminder",
-        "deletetask": "deleteTask",
-        "rescheduletask": "rescheduleTask",
-        "appendtotask": "appendToTask",
-        "updatetasktitle": "updateTaskTitle",
-        "renametask": "updateTaskTitle",
-        "edittitle": "updateTaskTitle",
-        "updaterecurrence": "updateRecurrence",
-        "editrecurrence": "updateRecurrence",
-        "changerecurrence": "updateRecurrence",
-        "updatealertstyle": "updateAlertStyle",
-        "editalertstyle": "updateAlertStyle",
-        "changealertstyle": "updateAlertStyle",
-        "setalertstyle": "updateAlertStyle",
-    }
-    return to_canonical.get(collapsed, "unknown")
-
-
-def _coerce_optional_str(v: Any) -> Optional[str]:
-    if v is None:
-        return None
-    if isinstance(v, str):
-        t = v.strip()
-        return t if t else None
-    return str(v)
-
-
-def _coerce_optional_bool(v: Any) -> Optional[bool]:
-    if v is None:
-        return None
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        return bool(v)
-    return None
-
-
-def _coerce_optional_float(v: Any) -> Optional[float]:
-    if v is None:
-        return None
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return None
-
-
-def _coerce_alert_style(v: Any) -> Optional[str]:
-    raw = _coerce_optional_str(v)
-    if not raw:
-        return None
-    collapsed = re.sub(r"[_\s-]+", "", raw).lower()
-    mapping = {
-        "silent": "silent",
-        "quiet": "silent",
-        "nosound": "silent",
-        "mute": "silent",
-        "muted": "silent",
-        "静音": "silent",
-        "不要声音": "silent",
-        "default": "default",
-        "normal": "default",
-        "standard": "default",
-        "普通": "default",
-        "普通提醒": "default",
-        "important": "important",
-        "loud": "important",
-        "strong": "important",
-        "alarmlike": "important",
-        "重要": "important",
-        "重要提醒": "important",
-        "明显一点": "important",
-        "声音大一点": "important",
-    }
-    return mapping.get(collapsed)
-
-
-def _sanitize_weekdays(v: Any) -> Optional[list[int]]:
-    if not isinstance(v, list):
-        return None
-    days: list[int] = []
-    for item in v:
-        try:
-            day = int(item)
-        except (TypeError, ValueError):
-            continue
-        if 1 <= day <= 7 and day not in days:
-            days.append(day)
-    return sorted(days) if days else None
-
-
-def _coerce_recurrence(v: Any) -> Optional[dict[str, Any]]:
-    if not isinstance(v, dict):
-        return None
-    recurrence = {
-        "frequency": _coerce_optional_str(v.get("frequency")),
-        "weekdays": _sanitize_weekdays(v.get("weekdays")),
-        "time": _coerce_optional_str(v.get("time")),
-        "timezone": _coerce_optional_str(v.get("timezone")),
-        "start_date": _coerce_optional_str(v.get("start_date")),
-        "end_date": _coerce_optional_str(v.get("end_date")),
-    }
-    return recurrence if any(value is not None for value in recurrence.values()) else None
-
-
-def _coerce_recurrence_update(v: Any) -> Optional[dict[str, Any]]:
-    if not isinstance(v, dict):
-        return None
-    update = {
-        "operation": _coerce_optional_str(v.get("operation")),
-        "weekdays": _sanitize_weekdays(v.get("weekdays")),
-        "time": _coerce_optional_str(v.get("time")),
-        "timezone": _coerce_optional_str(v.get("timezone")),
-        "start_date": _coerce_optional_str(v.get("start_date")),
-        "end_date": _coerce_optional_str(v.get("end_date")),
-    }
-    return update if any(value is not None for value in update.values()) else None
-
-
-def _parse_response_from_llm_dict(data: dict[str, Any]) -> ParseResponse:
-    """Build ParseResponse from raw JSON object; tolerate minor type drift from the model."""
-    return ParseResponse(
-        action_type=_normalize_action_type(data.get("action_type")),
-        title=_coerce_optional_str(data.get("title")),
-        notes=_coerce_optional_str(data.get("notes")),
-        scheduled_at=_coerce_optional_str(data.get("scheduled_at")),
-        end_at=_coerce_optional_str(data.get("end_at")),
-        has_specific_time=_coerce_optional_bool(data.get("has_specific_time")),
-        language_code=_coerce_optional_str(data.get("language_code")),
-        confidence=_coerce_optional_float(data.get("confidence")),
-        recurrence=_coerce_recurrence(data.get("recurrence")),
-        alert_style=_coerce_alert_style(data.get("alert_style")),
-        target_time=_coerce_optional_str(data.get("target_time")),
-        new_scheduled_at=_coerce_optional_str(data.get("new_scheduled_at")),
-        append_text=_coerce_optional_str(data.get("append_text")),
-        new_title=_coerce_optional_str(data.get("new_title")),
-        target_reference_type=_coerce_optional_str(data.get("target_reference_type")),
-        target_task_id=_coerce_optional_str(data.get("target_task_id")),
-        recurrence_update=_coerce_recurrence_update(data.get("recurrence_update")),
-    )
-
-
 def _coerce_resolution(raw: Optional[Any]) -> str:
     if raw is None:
         return "no_match"
@@ -376,7 +146,7 @@ def _coerce_resolution(raw: Optional[Any]) -> str:
 
 def _parse_task_target_resolution(data: dict[str, Any], allowed_ids: set[str]) -> TaskTargetResolveResponse:
     resolution = _coerce_resolution(data.get("resolution"))
-    selected_id = _coerce_optional_str(data.get("selected_id"))
+    selected_id = coerce_optional_str(data.get("selected_id"))
     if selected_id not in allowed_ids:
         selected_id = None
 
@@ -384,13 +154,13 @@ def _parse_task_target_resolution(data: dict[str, Any], allowed_ids: set[str]) -
     raw_candidates = data.get("candidates")
     if isinstance(raw_candidates, list):
         for item in raw_candidates:
-            cid = _coerce_optional_str(item)
+            cid = coerce_optional_str(item)
             if cid in allowed_ids and cid not in candidate_ids:
                 candidate_ids.append(cid)
 
-    confidence = _coerce_optional_float(data.get("confidence")) or 0.0
+    confidence = coerce_optional_float(data.get("confidence")) or 0.0
     confidence = max(0.0, min(1.0, confidence))
-    reason = _coerce_optional_str(data.get("reason"))
+    reason = coerce_optional_str(data.get("reason"))
 
     if resolution in {"resolved", "needs_confirmation"} and not selected_id:
         resolution = "no_match"
@@ -457,9 +227,9 @@ def _sanitize_interpret_response(data: dict[str, Any], allowed_ids: set[str], ac
         response.edit.new_title = None
 
     if response.create:
-        response.create.alert_style = _coerce_alert_style(response.create.alert_style)
+        response.create.alert_style = coerce_alert_style(response.create.alert_style)
     if response.edit:
-        response.edit.alert_style = _coerce_alert_style(response.edit.alert_style)
+        response.edit.alert_style = coerce_alert_style(response.edit.alert_style)
 
     if response.confirmation_kind is None:
         response.confirmation_kind = "none" if not response.requires_confirmation else "confirm_action"
@@ -467,9 +237,7 @@ def _sanitize_interpret_response(data: dict[str, Any], allowed_ids: set[str], ac
 
 
 async def transcribe_audio(file_bytes: bytes, filename: str, content_type: str) -> str:
-    """
-    Send audio bytes to OpenAI's audio transcription endpoint and return the transcript text.
-    """
+    """Send audio bytes to OpenAI's audio transcription endpoint and return the transcript text."""
     headers = _auth_headers()
 
     async with httpx.AsyncClient(timeout=60.0) as client:
@@ -486,103 +254,6 @@ async def transcribe_audio(file_bytes: bytes, filename: str, content_type: str) 
 
     result = response.json()
     return result.get("text", "")
-
-
-def _truncate_notes(s: Optional[str], max_len: int = 1200) -> Optional[str]:
-    if s is None:
-        return None
-    t = s.strip()
-    if len(t) <= max_len:
-        return t
-    return t[: max_len - 1] + "…"
-
-
-async def parse_task_text(
-    *,
-    text: str,
-    now: str,
-    timezone: str,
-    locale: Optional[str] = None,
-    parse_instructions: Optional[str] = None,
-    source: Optional[str] = None,
-    last_active_task_id: Optional[str] = None,
-    active_task_title: Optional[str] = None,
-    active_task_scheduled_at: Optional[str] = None,
-    active_task_notes: Optional[str] = None,
-    active_task_recurrence: Optional[dict[str, Any]] = None,
-) -> ParseResponse:
-    """
-    Send task text to OpenAI chat completions and return structured ParseResponse (iOS contract).
-    """
-    headers = {**_auth_headers(), "Content-Type": "application/json"}
-
-    system_content = PARSE_SYSTEM_PROMPT
-    if parse_instructions and parse_instructions.strip():
-        # Client hints are additive; the block above remains authoritative.
-        system_content = (
-            f"{PARSE_SYSTEM_PROMPT}\n\n---\nClient parsing hints (follow when consistent with rules above):\n"
-            f"{parse_instructions.strip()}"
-        )
-
-    user_lines = [
-        f'Parse this task:\n\nText: "{text}"',
-        f"Current time (ISO 8601): {now}",
-        f"Timezone (IANA): {timezone}",
-    ]
-    if locale:
-        user_lines.append(f"Locale: {locale}")
-    if source:
-        user_lines.append(f"Input source: {source}")
-    if last_active_task_id and str(last_active_task_id).strip():
-        user_lines.append("")
-        user_lines.append("Active task context (for follow-up commands; user may refer to this task without naming it):")
-        user_lines.append(f"- task_id: {last_active_task_id.strip()}")
-        user_lines.append('- target_reference_type to use for active-task follow-ups: "recent_task"')
-        user_lines.append(f"- target_task_id to use for active-task follow-ups: {last_active_task_id.strip()}")
-        if active_task_title:
-            user_lines.append(f'- title: "{active_task_title.strip()}"')
-        if active_task_scheduled_at:
-            user_lines.append(f"- scheduled_at (ISO 8601): {active_task_scheduled_at.strip()}")
-        if active_task_recurrence:
-            user_lines.append(f"- recurrence: {json.dumps(active_task_recurrence, ensure_ascii=False)}")
-        notes_ctx = _truncate_notes(active_task_notes)
-        if notes_ctx:
-            user_lines.append(f"- notes (may be truncated): {notes_ctx}")
-    user_message = "\n".join(user_lines)
-
-    payload = {
-        "model": OPENAI_PARSE_MODEL,
-        "temperature": 0,
-        "messages": [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": user_message},
-        ],
-        "response_format": {"type": "json_object"},
-    }
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
-            f"{OPENAI_BASE_URL}/chat/completions",
-            headers=headers,
-            json=payload,
-        )
-
-    if response.status_code != 200:
-        logger.error("OpenAI parse error %s: %s", response.status_code, response.text)
-        response.raise_for_status()
-
-    raw_content = response.json()["choices"][0]["message"]["content"]
-
-    try:
-        data = json.loads(raw_content)
-    except json.JSONDecodeError as e:
-        logger.error("Failed to decode OpenAI JSON response: %s\nRaw: %s", e, raw_content)
-        raise ValueError(f"Model returned invalid JSON: {e}") from e
-
-    if not isinstance(data, dict):
-        raise ValueError("Model returned JSON that is not an object")
-
-    return _parse_response_from_llm_dict(data)
 
 
 async def resolve_task_target(
@@ -658,7 +329,7 @@ async def interpret_command(
     request_id: Optional[str] = None,
 ) -> CommandInterpretResponse:
     headers = {**_auth_headers(), "Content-Type": "application/json"}
-    active_id = _coerce_optional_str((active_task or {}).get("id"))
+    active_id = coerce_optional_str((active_task or {}).get("id"))
     allowed_ids = {str(candidate.get("id")) for candidate in candidate_tasks if candidate.get("id")}
     if active_id:
         allowed_ids.add(active_id)
