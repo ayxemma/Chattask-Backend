@@ -28,7 +28,7 @@ PARSE_SYSTEM_PROMPT = """You are a task parsing assistant for a productivity app
 - "confidence": number or null — 0.0–1.0 parse confidence; null if unsure.
 - "language_code": string or null — ISO 639-1 (or best guess) for the input text.
 - "recurrence": object or null — weekly recurrence metadata for recurring creates. Shape: {"frequency":"weekly","weekdays":[1..7],"time":"HH:mm","timezone":"IANA zone","start_date":"YYYY-MM-DD or ISO datetime","end_date":null or date}. Use ISO weekdays where Monday=1 and Sunday=7.
-- "alert_style": "silent" | "default" | "important" | null — user-facing reminder alert importance style.
+- "alert_style": "normal" | "important" | null — user-facing reminder alert type.
 - "target_time": string or null — for edit commands only: ISO 8601 instant identifying which existing item to change (usually the task's current scheduled time the user refers to).
 - "new_scheduled_at": string or null — for rescheduleTask only: ISO 8601 new scheduled instant.
 - "append_text": string or null — for appendToTask only: text to add to notes (no need to repeat existing content).
@@ -86,11 +86,10 @@ Examples (scheduled_at relative to Current time):
   - "不要周五提醒了" means action_type="updateRecurrence", target_reference_type="recent_task", target_task_id=last_active_task_id, recurrence_update.operation="remove_weekdays", recurrence_update.weekdays=[5].
 
 ## Alert style
-- Support simple product-facing reminder alert styles only: "silent", "default", "important".
+- Support only two product-facing reminder alert types: "normal", "important".
 - Do not describe this as a true alarm, Critical Alert, or something that bypasses Silent Mode or Focus.
-- Map 静音 / silent / no sound / 不要声音提醒 to alert_style="silent".
-- Map normal / default / 普通提醒 to alert_style="default".
-- Map important / loud / alarm-like / 重要提醒 / 明显一点 / 声音大一点 to alert_style="important".
+- Map normal / default / silent / 普通提醒 / 静音 / no sound to alert_style="normal".
+- Map important / loud / 重要提醒 / 明显一点 / 声音大一点 to alert_style="important".
 - For creates, set alert_style when the user specifies one; otherwise null.
 - For existing task edits such as "把这个任务改成重要提醒", use action_type="updateAlertStyle" and set alert_style.
 
@@ -184,7 +183,7 @@ Rules:
 - If required fields are missing or intent is unclear, action_type="unknown", confirmation_kind="clarify".
 - Delete should usually require confirmation unless confidence is very high and active_task was explicitly referenced.
 - For weekly recurrence creates, set create.recurrence_type="weekly" and ISO weekdays Monday=1...Sunday=7.
-- For alert style, use only "silent", "default", or "important". Map 静音/silent/no sound/不要声音提醒 to "silent"; normal/default/普通提醒 to "default"; important/loud/alarm-like/重要提醒/明显一点/声音大一点 to "important".
+- For alert style, use only "normal" or "important". Map silent/default/普通/静音/no sound to "normal"; important/loud/重要提醒/明显一点/声音大一点 to "important".
 - For create commands, put alert style in create.alert_style when specified.
 - For existing task alert edits such as "把这个任务改成重要提醒", use action_type="updateAlertStyle" and put the value in edit.alert_style.
 - Do not call Important a true alarm or imply it can bypass Silent Mode or Focus.
@@ -266,22 +265,30 @@ def _coerce_alert_style(v: Any) -> Optional[str]:
         return None
     collapsed = re.sub(r"[_\s-]+", "", raw).lower()
     mapping = {
-        "silent": "silent",
-        "quiet": "silent",
-        "nosound": "silent",
-        "mute": "silent",
-        "muted": "silent",
-        "静音": "silent",
-        "不要声音": "silent",
-        "default": "default",
-        "normal": "default",
-        "standard": "default",
-        "普通": "default",
-        "普通提醒": "default",
+        "silent": "normal",
+        "quiet": "normal",
+        "nosound": "normal",
+        "mute": "normal",
+        "muted": "normal",
+        "静音": "normal",
+        "不要声音": "normal",
+        "default": "normal",
+        "normal": "normal",
+        "standard": "normal",
+        "普通": "normal",
+        "普通提醒": "normal",
+        "sound": "normal",
+        "soundonly": "normal",
+        "vibration": "normal",
+        "vibrate": "normal",
+        "vibrationonly": "normal",
+        "vibrateonly": "normal",
         "important": "important",
         "loud": "important",
         "strong": "important",
         "alarmlike": "important",
+        "soundandvibration": "important",
+        "soundvibration": "important",
         "重要": "important",
         "重要提醒": "important",
         "明显一点": "important",
