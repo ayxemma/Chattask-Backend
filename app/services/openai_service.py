@@ -1,7 +1,6 @@
 import json
 import logging
 import re
-import time
 from typing import Any, Optional
 
 import httpx
@@ -12,7 +11,7 @@ from app.config import (
     OPENAI_PARSE_MODEL,
     OPENAI_TRANSCRIBE_MODEL,
 )
-from app.models.parse_models import CommandInterpretAction, CommandInterpretResponse, ParseResponse, TaskTargetResolveResponse
+from app.models.parse_models import CommandInterpretResponse, ParseResponse, TaskTargetResolveResponse
 
 logger = logging.getLogger(__name__)
 
@@ -128,61 +127,48 @@ Respond with valid JSON only."""
 
 
 COMMAND_INTERPRETER_PROMPT = """You are ChatTask's one-shot command interpreter.
-Interpret the user's full command into a complete execution plan: one or more ordered actions, intended edit targets, edit/create fields, confidence, and short assistant responses.
+Interpret the user's command, the intended edit target, edit/create fields, confidence, and the short assistant response.
 Return exactly one JSON object matching the schema below. No markdown.
 
 Schema:
 {
-  "actions": [
-    {
-      "action_type": "createReminder" | "createEvent" | "rescheduleTask" | "renameTask" | "appendToTask" | "deleteTask" | "updateRecurrence" | "updateAlertStyle" | "unknown",
-      "confidence": 0.0,
-      "requires_confirmation": false,
-      "confirmation_kind": "none" | "confirm_action" | "choose_candidate" | "clarify",
-      "assistant_message": "...",
-      "target": {
-        "resolution": "active_task" | "candidate" | "ambiguous" | "none",
-        "selected_task_id": null,
-        "selected_task_title": null,
-        "candidate_ids": null,
-        "reason": "..."
-      },
-      "create": {
-        "title": null,
-        "notes": null,
-        "scheduled_at": null,
-        "end_at": null,
-        "has_specific_time": null,
-        "recurrence_type": "none",
-        "recurrence_weekdays": null,
-        "recurrence_end_at": null,
-        "alert_style": null
-      },
-      "edit": {
-        "new_title": null,
-        "new_scheduled_at": null,
-        "append_text": null,
-        "new_recurrence_type": null,
-        "new_recurrence_weekdays": null,
-        "alert_style": null,
-        "apply_scope": "single"
-      }
-    }
-  ],
-  "assistant_message": "Concise overall user-facing response or confirmation question"
+  "action_type": "createReminder" | "createEvent" | "rescheduleTask" | "renameTask" | "appendToTask" | "deleteTask" | "updateRecurrence" | "updateAlertStyle" | "unknown",
+  "confidence": 0.0,
+  "requires_confirmation": true,
+  "confirmation_kind": "none" | "confirm_action" | "choose_candidate" | "clarify",
+  "assistant_message": "...",
+  "target": {
+    "resolution": "active_task" | "candidate" | "ambiguous" | "none",
+    "selected_task_id": null,
+    "selected_task_title": null,
+    "candidate_ids": null,
+    "reason": "..."
+  },
+  "create": {
+    "title": null,
+    "notes": null,
+    "scheduled_at": null,
+    "end_at": null,
+    "has_specific_time": null,
+    "recurrence_type": "none",
+    "recurrence_weekdays": null,
+    "recurrence_end_at": null,
+    "alert_style": null
+  },
+  "edit": {
+    "new_title": null,
+    "new_scheduled_at": null,
+    "append_text": null,
+    "new_recurrence_type": null,
+    "new_recurrence_weekdays": null,
+    "alert_style": null,
+    "apply_scope": "single"
+  }
 }
 
 Rules:
-- Always return actions=[...]. If there is only one action, still return one action in actions.
-- For backward compatibility, you may also mirror the first action into top-level action_type/confidence/target/create/edit fields, but actions is the source of truth.
-- Determine semantically whether the command has one action or multiple actions. Do not require explicit separators. Understand English and Chinese multi-action speech naturally.
-- Preserve execution order from the user's intent. If action 1 edits the active task and action 2 creates a new reminder, action 2 must not target the edited task unless the user explicitly says it should.
-- The frontend will execute actions sequentially. Include all requested actions; do not silently drop later actions.
 - Use create.* only for createReminder/createEvent.
 - Use target.* and edit.* only for edit actions.
-- Decide semantically whether extra content is a new reminder or append-to-task:
-  - "also remind me to buy vegetables" / "买菜...也提醒我" means a separate createReminder.
-  - "add ... to this task" / "备注里加上..." means appendToTask for the existing task.
 - Do not mix target title and new title. new_title is only for explicit rename/title changes.
 - "改成 + time", "改到 + time", "换到 + time" means rescheduleTask, NOT renameTask.
   Examples: "把这个改成四点半", "把给艾瑞喂水果酸奶的任务改成四点半", "改到下午四点半", "换到明天九点".
@@ -202,13 +188,6 @@ Rules:
 - For existing task alert edits such as "把这个任务改成重要提醒", use action_type="updateAlertStyle" and put the value in edit.alert_style.
 - Do not call Important a true alarm or imply it can bypass Silent Mode or Focus.
 - Always resolve relative times from Current time and Timezone. Use ISO 8601 datetimes with timezone offset.
-
-Examples:
-- "Actually change it to tomorrow at 11 and also remind me to buy vegetables, tomatoes, potatoes." -> actions: reschedule active task; createReminder title "buy vegetables, tomatoes, potatoes".
-- "把这个改到明天十一点，买菜西红柿土豆也提醒我" -> actions: reschedule active task; createReminder title "买菜西红柿土豆".
-- "把这个改到明天十一点，备注里加上买菜西红柿土豆" -> actions: reschedule active task; appendToTask append_text "买菜西红柿土豆".
-- "Cancel this task and remind me to call mom tomorrow" -> actions: delete active task; createReminder title "call mom".
-- "Add tomatoes and potatoes to this task" -> one appendToTask action, not a new reminder.
 
 Respond with valid JSON only."""
 
@@ -461,65 +440,36 @@ def _normalize_interpret_action(raw: Optional[Any]) -> str:
     return mapping.get(collapsed, "unknown")
 
 
-def _sanitize_interpret_action(action: CommandInterpretAction, allowed_ids: set[str], active_id: Optional[str]) -> CommandInterpretAction:
-    action.action_type = _normalize_interpret_action(action.action_type)
-    action.confidence = max(0.0, min(1.0, action.confidence or 0.0))
+def _sanitize_interpret_response(data: dict[str, Any], allowed_ids: set[str], active_id: Optional[str]) -> CommandInterpretResponse:
+    response = CommandInterpretResponse.model_validate(data)
+    response.action_type = _normalize_interpret_action(response.action_type)
+    response.confidence = max(0.0, min(1.0, response.confidence or 0.0))
 
-    if action.target:
-        if action.target.selected_task_id not in allowed_ids and action.target.selected_task_id != active_id:
-            action.target.selected_task_id = None
-            action.target.selected_task_title = None
-            if action.target.resolution in {"active_task", "candidate"}:
-                action.target.resolution = "none"
-        if action.target.candidate_ids:
-            action.target.candidate_ids = [
-                cid for cid in action.target.candidate_ids
+    if response.target:
+        if response.target.selected_task_id not in allowed_ids and response.target.selected_task_id != active_id:
+            response.target.selected_task_id = None
+            response.target.selected_task_title = None
+            if response.target.resolution in {"active_task", "candidate"}:
+                response.target.resolution = "none"
+        if response.target.candidate_ids:
+            response.target.candidate_ids = [
+                cid for cid in response.target.candidate_ids
                 if cid in allowed_ids or cid == active_id
             ][:3]
 
-    if action.action_type == "renameTask" and action.edit and action.edit.new_scheduled_at and not action.edit.new_title:
+    if response.action_type == "renameTask" and response.edit and response.edit.new_scheduled_at and not response.edit.new_title:
         logger.warning("interpretWarnings renameTask has new_scheduled_at but no new_title; converting to rescheduleTask")
-        action.action_type = "rescheduleTask"
-    if action.action_type == "rescheduleTask" and action.edit:
-        action.edit.new_title = None
+        response.action_type = "rescheduleTask"
+    if response.action_type == "rescheduleTask" and response.edit:
+        response.edit.new_title = None
 
-    if action.create:
-        action.create.alert_style = _coerce_alert_style(action.create.alert_style)
-    if action.edit:
-        action.edit.alert_style = _coerce_alert_style(action.edit.alert_style)
+    if response.create:
+        response.create.alert_style = _coerce_alert_style(response.create.alert_style)
+    if response.edit:
+        response.edit.alert_style = _coerce_alert_style(response.edit.alert_style)
 
-    if action.confirmation_kind is None:
-        action.confirmation_kind = "none" if not action.requires_confirmation else "confirm_action"
-    return action
-
-
-def _sanitize_interpret_response(data: dict[str, Any], allowed_ids: set[str], active_id: Optional[str]) -> CommandInterpretResponse:
-    response = CommandInterpretResponse.model_validate(data)
-    raw_actions = response.actions
-    if not raw_actions:
-        raw_actions = [
-            CommandInterpretAction(
-                action_type=response.action_type,
-                confidence=response.confidence,
-                requires_confirmation=response.requires_confirmation,
-                confirmation_kind=response.confirmation_kind,
-                assistant_message=response.assistant_message,
-                target=response.target,
-                create=response.create,
-                edit=response.edit,
-            )
-        ]
-    response.actions = [_sanitize_interpret_action(action, allowed_ids, active_id) for action in raw_actions]
-    first = response.actions[0] if response.actions else CommandInterpretAction(action_type="unknown")
-    response.action_type = first.action_type
-    response.confidence = first.confidence
-    response.requires_confirmation = any(action.requires_confirmation for action in response.actions)
-    response.confirmation_kind = first.confirmation_kind
-    response.target = first.target
-    response.create = first.create
-    response.edit = first.edit
-    if not response.assistant_message:
-        response.assistant_message = first.assistant_message
+    if response.confirmation_kind is None:
+        response.confirmation_kind = "none" if not response.requires_confirmation else "confirm_action"
     return response
 
 
@@ -714,14 +664,13 @@ async def interpret_command(
     candidate_tasks: list[dict[str, Any]],
     request_id: Optional[str] = None,
 ) -> CommandInterpretResponse:
-    total_start = time.perf_counter()
     headers = {**_auth_headers(), "Content-Type": "application/json"}
     active_id = _coerce_optional_str((active_task or {}).get("id"))
     allowed_ids = {str(candidate.get("id")) for candidate in candidate_tasks if candidate.get("id")}
     if active_id:
         allowed_ids.add(active_id)
     logger.info(
-        "interpretCommandStart request_id=%s text=%s candidate_count=%s active_task_present=%s",
+        "interpretRequest request_id=%s text=%s candidate_count=%s active_task_present=%s",
         request_id,
         text,
         len(candidate_tasks),
@@ -744,15 +693,12 @@ async def interpret_command(
         ],
         "response_format": {"type": "json_object"},
     }
-    llm_start = time.perf_counter()
-    logger.info("llmCallStart request_id=%s endpoint=interpret-command", request_id)
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(
             f"{OPENAI_BASE_URL}/chat/completions",
             headers=headers,
             json=payload,
         )
-    logger.info("llmCallDurationMs request_id=%s duration_ms=%s", request_id, int((time.perf_counter() - llm_start) * 1000))
     if response.status_code != 200:
         logger.error("OpenAI command interpretation error %s: %s", response.status_code, response.text)
         response.raise_for_status()
@@ -765,7 +711,6 @@ async def interpret_command(
     if not isinstance(data, dict):
         raise ValueError("Model returned JSON that is not an object")
     result = _sanitize_interpret_response(data, allowed_ids, active_id)
-    actions = result.actions or []
     logger.info(
         "interpretResult action_type=%s confidence=%s requires_confirmation=%s target_resolution=%s selected_id=%s",
         result.action_type,
@@ -774,14 +719,4 @@ async def interpret_command(
         result.target.resolution if result.target else None,
         result.target.selected_task_id if result.target else None,
     )
-    logger.info("interpretActionsCount request_id=%s count=%s", request_id, len(actions))
-    for index, action in enumerate(actions):
-        logger.info(
-            "action[%s] type=%s confidence=%s targetResolution=%s",
-            index,
-            action.action_type,
-            action.confidence,
-            action.target.resolution if action.target else None,
-        )
-    logger.info("interpretCommandTotalMs request_id=%s duration_ms=%s", request_id, int((time.perf_counter() - total_start) * 1000))
     return result
