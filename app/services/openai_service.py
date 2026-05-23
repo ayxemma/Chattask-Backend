@@ -134,6 +134,7 @@ Preserve the existing single-action contract:
 - For a single command, fill the top-level fields exactly as before. You may omit actions or return actions with one matching item.
 - For multiple independent actions in one sentence, return actions with every action in execution order. Also mirror the first action into the top-level fields for backward compatibility.
 - Do not split by keywords mechanically. Decide semantically whether the user means separate actions or one edit.
+- Do not discard trailing details after an edit. If the user edits the active task and then adds a related detail about what they will do/bring/take/remember, return a second appendToTask action unless they explicitly ask for a separate reminder/task.
 - If the multi-action plan is uncertain, set requires_confirmation=true on the uncertain action(s) or use a clarifying assistant_message.
 - If you cannot produce a valid multi-action plan, return the best single-action interpretation so the original parser can handle fallback safely.
 
@@ -191,6 +192,8 @@ Rules:
   "Remind me tomorrow at 11 to call mom and also remind me to buy tomatoes." => two createReminder actions.
   "Change this to tomorrow at 11 and add a note to buy vegetables." => reschedule active task, then appendToTask on the same task.
   "Change this to tomorrow at 11 and remind me to buy vegetables." => reschedule active task, then createReminder for buy vegetables.
+  "Change it to 11:30pm and I'll bring my cup to my room." => reschedule active task, then appendToTask with "bring my cup to my room".
+  "Change it to 11:30pm and remember to bring my cup to my room." => reschedule active task, then appendToTask with "bring my cup to my room".
   "把这个改到明天十一点，备注里加上买菜西红柿土豆" => reschedule active task, then appendToTask.
   "把这个改到明天十一点，买菜西红柿土豆也提醒我" => reschedule active task, then createReminder.
 - Use create.* only for createReminder/createEvent.
