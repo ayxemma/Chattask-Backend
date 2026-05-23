@@ -89,6 +89,7 @@ class TaskTargetCandidate(BaseModel):
     scheduled_at: Optional[str] = None
     is_recurring: bool = False
     recurrence_label: Optional[str] = None
+    notes_snippet: Optional[str] = None
 
 
 class TaskTargetResolveRequest(BaseModel):
@@ -126,6 +127,7 @@ class CommandInterpretActiveTask(BaseModel):
     scheduled_at: Optional[str] = None
     is_recurring: bool = False
     recurrence_label: Optional[str] = None
+    notes_snippet: Optional[str] = None
 
 
 class CommandInterpretRequest(BaseModel):
@@ -178,8 +180,8 @@ class CommandInterpretEdit(BaseModel):
     apply_scope: Optional[str] = None
 
 
-class CommandInterpretResponse(BaseModel):
-    """Structured one-shot command interpretation returned to iOS."""
+class CommandInterpretAction(BaseModel):
+    """One executable command action in a one-shot interpretation plan."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -191,3 +193,11 @@ class CommandInterpretResponse(BaseModel):
     target: Optional[CommandInterpretTarget] = None
     create: Optional[CommandInterpretCreate] = None
     edit: Optional[CommandInterpretEdit] = None
+
+
+class CommandInterpretResponse(CommandInterpretAction):
+    """Structured one-shot command interpretation returned to iOS."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    actions: Optional[list[CommandInterpretAction]] = None
