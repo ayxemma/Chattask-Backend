@@ -9,6 +9,7 @@ from app.models.parse_models import (
     CommandInterpretResponse,
     CommandInterpretTarget,
 )
+from app.services.openai_service import _sanitize_interpret_response
 
 
 VALID_PAYLOAD = {
@@ -130,6 +131,39 @@ def test_interpret_command_multi_action_response_shape(client: TestClient):
     assert data["actions"][0]["action_type"] == "rescheduleTask"
     assert data["actions"][1]["action_type"] == "createReminder"
     assert data["actions"][1]["create"]["title"] == "buy tomatoes"
+
+
+def test_interpret_command_splits_compound_reschedule_append_action():
+    result = _sanitize_interpret_response(
+        {
+            "actions": [
+                {
+                    "action_type": "rescheduleTask",
+                    "confidence": 0.94,
+                    "requires_confirmation": False,
+                    "confirmation_kind": "none",
+                    "target": {
+                        "resolution": "active_task",
+                        "selected_task_id": "550e8400-e29b-41d4-a716-446655440000",
+                    },
+                    "edit": {
+                        "new_scheduled_at": "2026-05-18T11:00:00-04:00",
+                        "append_text": "buy vegetables",
+                    },
+                }
+            ]
+        },
+        allowed_ids={"550e8400-e29b-41d4-a716-446655440000"},
+        active_id="550e8400-e29b-41d4-a716-446655440000",
+    )
+    assert result.actions is not None
+    assert len(result.actions) == 2
+    assert result.actions[0].action_type == "rescheduleTask"
+    assert result.actions[0].edit.new_scheduled_at == "2026-05-18T11:00:00-04:00"
+    assert result.actions[0].edit.append_text is None
+    assert result.actions[1].action_type == "appendToTask"
+    assert result.actions[1].edit.append_text == "buy vegetables"
+    assert result.actions[1].target.selected_task_id == "550e8400-e29b-41d4-a716-446655440000"
 
 
 def test_interpret_command_rejects_empty_text(client: TestClient):

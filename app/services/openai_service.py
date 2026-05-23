@@ -502,16 +502,51 @@ def _sanitize_interpret_action(
     return action
 
 
+def _expand_compound_interpret_action(action: CommandInterpretAction) -> list[CommandInterpretAction]:
+    """Split model outputs that packed two edit fields into one action.
+
+    This keeps semantic interpretation in the LLM while making the structured
+    response executable. For example, a reschedule action that also has
+    edit.append_text should execute as reschedule + append note.
+    """
+    if (
+        action.action_type == "rescheduleTask"
+        and action.edit
+        and action.edit.new_scheduled_at
+        and action.edit.append_text
+    ):
+        append_edit = action.edit.model_copy()
+        append_edit.new_scheduled_at = None
+        reschedule_edit = action.edit.model_copy()
+        reschedule_edit.append_text = None
+        action.edit = reschedule_edit
+        return [
+            action,
+            CommandInterpretAction(
+                action_type="appendToTask",
+                confidence=action.confidence,
+                requires_confirmation=action.requires_confirmation,
+                confirmation_kind=action.confirmation_kind,
+                assistant_message=action.assistant_message,
+                target=action.target.model_copy() if action.target else None,
+                edit=append_edit,
+            ),
+        ]
+    return [action]
+
+
 def _sanitize_interpret_response(data: dict[str, Any], allowed_ids: set[str], active_id: Optional[str]) -> CommandInterpretResponse:
     response = CommandInterpretResponse.model_validate(data)
     _sanitize_interpret_action(response, allowed_ids, active_id)
 
     if response.actions:
-        response.actions = [
-            _sanitize_interpret_action(action, allowed_ids, active_id)
-            for action in response.actions
-            if action.action_type is not None
-        ]
+        expanded_actions: list[CommandInterpretAction] = []
+        for action in response.actions:
+            if action.action_type is None:
+                continue
+            sanitized = _sanitize_interpret_action(action, allowed_ids, active_id)
+            expanded_actions.extend(_expand_compound_interpret_action(sanitized))
+        response.actions = expanded_actions
         if response.actions:
             first = response.actions[0]
             response.action_type = first.action_type
@@ -521,6 +556,11 @@ def _sanitize_interpret_response(data: dict[str, Any], allowed_ids: set[str], ac
             response.target = first.target
             response.create = first.create
             response.edit = first.edit
+    else:
+        expanded_actions = _expand_compound_interpret_action(response)
+        if len(expanded_actions) > 1:
+            response.actions = expanded_actions
+            response.requires_confirmation = any(action.requires_confirmation for action in expanded_actions)
     return response
 
 
