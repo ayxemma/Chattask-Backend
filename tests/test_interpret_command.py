@@ -10,6 +10,8 @@ from app.models.parse_models import (
     CommandInterpretTarget,
 )
 from app.services.openai_service import (
+    _drop_spurious_clarify_actions,
+    _infer_input_language,
     _looks_like_multi_timed_create,
     _sanitize_interpret_response,
 )
@@ -307,3 +309,42 @@ def test_sanitize_logs_warning_when_multi_create_likely_dropped(caplog):
         "multiCreateExpectedButSingleActionReturned" in record.message
         for record in caplog.records
     )
+
+
+def test_infer_input_language_from_chinese_text():
+    assert _infer_input_language("把九点的任务改成十点。", "en") == "zh"
+
+
+def test_sanitize_drops_spurious_unknown_clarify_action():
+    result = _sanitize_interpret_response(
+        {
+            "actions": [
+                {
+                    "action_type": "rescheduleTask",
+                    "confidence": 0.9,
+                    "requires_confirmation": False,
+                    "confirmation_kind": "none",
+                    "target": {
+                        "resolution": "candidate",
+                        "selected_task_id": "550e8400-e29b-41d4-a716-446655440000",
+                    },
+                    "edit": {"new_scheduled_at": "2026-05-24T22:00:00-04:00"},
+                },
+                {
+                    "action_type": "unknown",
+                    "confidence": 0.0,
+                    "requires_confirmation": True,
+                    "confirmation_kind": "clarify",
+                    "assistant_message": "Could you clarify?",
+                },
+            ]
+        },
+        allowed_ids={"550e8400-e29b-41d4-a716-446655440000"},
+        active_id=None,
+        user_text="把九点的任务改成十点。",
+    )
+    assert result.actions is not None
+    assert len(result.actions) == 1
+    assert result.actions[0].action_type == "rescheduleTask"
+    assert result.requires_confirmation is False
+    assert result.confirmation_kind == "none"

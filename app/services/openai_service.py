@@ -157,6 +157,9 @@ Rules:
 - Weekly recurrence: recurrence_type="weekly", weekdays Monday=1..Sunday=7.
 - Alert style only "normal" or "important". Do not imply bypassing Silent Mode/Focus.
 - Resolve relative times from current_time and timezone. Use ISO 8601 datetimes with timezone offset.
+- Language: use input_language from the user JSON (derived from text, not locale). create.title, create.notes, edit.append_text, and assistant_message MUST stay in input_language. Never translate to English or locale language.
+- Reschedule by time reference: "把X点的任务改成Y点" => single rescheduleTask. Match the candidate whose local scheduled hour is X (晚上/九点 => 21:00). Set new_scheduled_at to Y点 preserving evening/morning context (九点改十点 => 22:00, not 10:00). requires_confirmation=false when one clear match.
+- Return only actions you intend to execute. Do NOT add a second unknown/clarify action alongside a confident reschedule/create.
 
 Examples:
 - "Change this to tomorrow at 11 and add a note to buy vegetables." => reschedule active task, appendToTask.
@@ -165,6 +168,8 @@ Examples:
 - "九点给艾瑞做早餐，十一点给艾瑞接回家。" => two createReminder actions at 09:00 and 11:00.
 - "提醒我周二早晨八点给艾瑞做早餐,十一点五十给艾瑞接回来。" => two createReminder actions at 08:00 and 11:50.
 - "把给艾瑞喂水果酸奶的任务改成四点半" => rescheduleTask on matched candidate.
+- "晚上九点的时候提醒我用吸尘器吸一下屋子。" => createReminder title in Chinese e.g. "用吸尘器吸一下屋子", scheduled_at 21:00 local.
+- "把九点的任务改成十点。" => single rescheduleTask matching the 21:00 task, new time 22:00 local, requires_confirmation=false.
 
 Respond with valid JSON only."""
 
@@ -585,6 +590,48 @@ def _count_create_actions(response: CommandInterpretResponse) -> int:
     return 0
 
 
+def _infer_input_language(text: str, locale: Optional[str]) -> str:
+    """Detect spoken/typed language from content; locale is UI hint only."""
+    if re.search(r"[\u4e00-\u9fff]", text):
+        return "zh"
+    if re.search(r"[\u3040-\u30ff\u31f0-\u31ff]", text):
+        return "ja"
+    if locale:
+        base = locale.split("_")[0].split("-")[0].lower()
+        if base in {"zh", "ja", "ko"}:
+            return base
+    return "en"
+
+
+def _drop_spurious_clarify_actions(actions: list[CommandInterpretAction]) -> list[CommandInterpretAction]:
+    """Remove extra unknown+clarify actions when a confident executable action exists."""
+    if len(actions) <= 1:
+        return actions
+    has_executable = any(
+        action.action_type not in (None, "unknown")
+        and not (action.requires_confirmation and action.confirmation_kind == "clarify")
+        for action in actions
+    )
+    if not has_executable:
+        return actions
+    pruned = [
+        action
+        for action in actions
+        if not (
+            action.action_type == "unknown"
+            and action.requires_confirmation
+            and action.confirmation_kind == "clarify"
+        )
+    ]
+    if pruned and len(pruned) < len(actions):
+        logger.info(
+            "interpretWarnings droppedSpuriousClarifyActions before=%s after=%s",
+            len(actions),
+            len(pruned),
+        )
+    return pruned or actions
+
+
 def _mirror_first_action_to_top_level(response: CommandInterpretResponse) -> None:
     if not response.actions:
         return
@@ -629,6 +676,9 @@ def _sanitize_interpret_response(
         response.create = sanitized_top.create
         response.edit = sanitized_top.edit
         response.actions = _expand_compound_interpret_action(sanitized_top)
+
+    if response.actions:
+        response.actions = _drop_spurious_clarify_actions(response.actions)
 
     _mirror_first_action_to_top_level(response)
 
@@ -897,6 +947,7 @@ async def interpret_command(
         "current_time": now,
         "timezone": timezone,
         "locale": locale,
+        "input_language": _infer_input_language(text, locale),
         "active_task": _slim_interpret_task(active_task),
         "candidate_tasks": [
             slim for task in candidate_tasks if (slim := _slim_interpret_task(task))
