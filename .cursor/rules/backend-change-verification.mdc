@@ -1,0 +1,42 @@
+---
+description: Do not regress backend behavior; run tests and smoke checks before finishing
+globs: "**/*"
+alwaysApply: true
+---
+
+# Backend change verification
+
+When changing ChatTask backend code, **do not break existing behavior**. Optimizations (prompt size, latency, refactors) must preserve parsing semantics.
+
+## Before finishing any change
+
+1. **Add or update tests** in `tests/` for new or changed behavior. Do not delete passing tests without explicit user approval.
+2. **Run unit tests** (required):
+   ```bash
+   cd ChatTask-backend && python3 -m pytest tests/ -q
+   ```
+3. **Run live smoke checks** when `.env` has a real `OPENAI_API_KEY`:
+   ```bash
+   python3 scripts/verify_changes.py --live
+   ```
+
+## Regression scenarios (must stay green)
+
+| Scenario | Input | Expected |
+|---|---|---|
+| Chinese create | `晚上九点...吸一下屋子` | title in Chinese, not English |
+| Reschedule + append | `把四点半...改成四点五十...,并且给Ery带点水` | 2 actions: reschedule + append |
+| Dual create | `八点做早餐,十一点五十接回来` | 2 createReminder actions |
+| Reschedule by hour | `把九点的任务改成十点` | 1 reschedule, no spurious clarify |
+| Simple create | `十分钟后喝水` | 1 createReminder |
+
+## Prompt / model changes
+
+- Shorter prompts still need the rules above — verify with `--live`, not just unit tests.
+- If changing `OPENAI_INTERPRET_MODEL`, re-run all smoke scenarios; faster models may drop multi-action quality.
+
+## Do not ship when
+
+- pytest fails
+- live smoke fails on a scenario that worked before your change
+- you removed test coverage for a bug that was recently fixed
