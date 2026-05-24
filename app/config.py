@@ -29,6 +29,14 @@ OPENAI_TRANSCRIBE_MODEL: str = (
 OPENAI_PARSE_MODEL: str = (
     _strip_or_none(os.getenv("OPENAI_PARSE_MODEL")) or "gpt-4o-mini"
 )
+OPENAI_INTERPRET_MODEL: str = (
+    _strip_or_none(os.getenv("OPENAI_INTERPRET_MODEL"))
+    or _strip_or_none(os.getenv("OPENAI_PARSE_MODEL"))
+    or "gpt-4o-mini"
+)
+OPENAI_INTERPRET_MAX_TOKENS: int = int(
+    _strip_or_none(os.getenv("OPENAI_INTERPRET_MAX_TOKENS")) or "900"
+)
 
 
 def cors_allow_origins() -> List[str]:

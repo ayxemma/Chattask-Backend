@@ -8,6 +8,8 @@ import httpx
 from app.config import (
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
+    OPENAI_INTERPRET_MAX_TOKENS,
+    OPENAI_INTERPRET_MODEL,
     OPENAI_PARSE_MODEL,
     OPENAI_TRANSCRIBE_MODEL,
 )
@@ -126,113 +128,43 @@ Rules:
 Respond with valid JSON only."""
 
 
-COMMAND_INTERPRETER_PROMPT = """You are ChatTask's one-shot command interpreter.
-Interpret the user's command, intended edit target, edit/create fields, confidence, and short assistant response.
-Return exactly one JSON object matching the schema below. No markdown.
+COMMAND_INTERPRETER_PROMPT = """You are ChatTask's one-shot command interpreter. Return exactly one JSON object matching the schema below. No markdown.
 
-Preserve the existing single-action contract:
-- For a single command, fill the top-level fields exactly as before. You may omit actions or return actions with one matching item.
-- For multiple independent actions in one sentence, return actions with every action in execution order. Also mirror the first action into the top-level fields for backward compatibility.
-- Do not split by keywords mechanically. Decide semantically whether the user means separate actions or one edit.
-- Do not discard trailing details after an edit. If the user edits the active task and then adds a related detail about what they will do/bring/take/remember, return a second appendToTask action unless they explicitly ask for a separate reminder/task.
-- Do not copy an edit time onto a separate new reminder unless the user explicitly gives that time for the reminder. "Change this to tomorrow at 11 and remind me to buy vegetables" creates an untimed buy-vegetables reminder.
-- If a trailing bare phrase after an edit could be either a note or a new reminder, ask for clarification instead of guessing.
-- If the multi-action plan is uncertain, set requires_confirmation=true on the uncertain action(s) or use a clarifying assistant_message.
-- If you cannot produce a valid multi-action plan, return the best single-action interpretation so the original parser can handle fallback safely.
+Contract:
+- Single command: fill top-level fields; omit actions or return one matching item.
+- Multiple independent actions: return actions[] in execution order and mirror the first action at top level.
+- Decide semantically; do not split by keywords alone.
+- Do not discard trailing details after an edit. If the user reschedules/renames the active task then adds what they will do/bring/remember, return appendToTask as a second action unless they clearly want a separate reminder.
+- Do not copy an edit time onto a separate new reminder unless the user gives that time for the reminder.
+- If a trailing phrase could be note vs new reminder, set requires_confirmation=true and confirmation_kind="clarify".
+- If uncertain about multi-action structure, return the best single-action plan.
 
 Schema:
-{
-  "actions": [
-    {
-      "action_type": "createReminder" | "createEvent" | "rescheduleTask" | "renameTask" | "appendToTask" | "deleteTask" | "updateRecurrence" | "updateAlertStyle" | "unknown",
-      "confidence": 0.0,
-      "requires_confirmation": false,
-      "confirmation_kind": "none" | "confirm_action" | "choose_candidate" | "clarify",
-      "assistant_message": "...",
-      "target": {"resolution": "active_task" | "candidate" | "ambiguous" | "none", "selected_task_id": null, "selected_task_title": null, "candidate_ids": null, "reason": "..."},
-      "create": {"title": null, "notes": null, "scheduled_at": null, "end_at": null, "has_specific_time": null, "recurrence_type": "none", "recurrence_weekdays": null, "recurrence_end_at": null, "alert_style": null},
-      "edit": {"new_title": null, "new_scheduled_at": null, "append_text": null, "new_recurrence_type": null, "new_recurrence_weekdays": null, "alert_style": null, "apply_scope": "single"}
-    }
-  ],
-  "action_type": "createReminder" | "createEvent" | "rescheduleTask" | "renameTask" | "appendToTask" | "deleteTask" | "updateRecurrence" | "updateAlertStyle" | "unknown",
-  "confidence": 0.0,
-  "requires_confirmation": true,
-  "confirmation_kind": "none" | "confirm_action" | "choose_candidate" | "clarify",
-  "assistant_message": "...",
-  "target": {
-    "resolution": "active_task" | "candidate" | "ambiguous" | "none",
-    "selected_task_id": null,
-    "selected_task_title": null,
-    "candidate_ids": null,
-    "reason": "..."
-  },
-  "create": {
-    "title": null,
-    "notes": null,
-    "scheduled_at": null,
-    "end_at": null,
-    "has_specific_time": null,
-    "recurrence_type": "none",
-    "recurrence_weekdays": null,
-    "recurrence_end_at": null,
-    "alert_style": null
-  },
-  "edit": {
-    "new_title": null,
-    "new_scheduled_at": null,
-    "append_text": null,
-    "new_recurrence_type": null,
-    "new_recurrence_weekdays": null,
-    "alert_style": null,
-    "apply_scope": "single"
-  }
-}
+{"actions":[{"action_type":"createReminder|createEvent|rescheduleTask|renameTask|appendToTask|deleteTask|updateRecurrence|updateAlertStyle|unknown","confidence":0.0,"requires_confirmation":false,"confirmation_kind":"none|confirm_action|choose_candidate|clarify","assistant_message":"...","target":{"resolution":"active_task|candidate|ambiguous|none","selected_task_id":null,"selected_task_title":null,"candidate_ids":null,"reason":"..."},"create":{"title":null,"notes":null,"scheduled_at":null,"end_at":null,"has_specific_time":null,"recurrence_type":"none","recurrence_weekdays":null,"recurrence_end_at":null,"alert_style":null},"edit":{"new_title":null,"new_scheduled_at":null,"append_text":null,"new_recurrence_type":null,"new_recurrence_weekdays":null,"alert_style":null,"apply_scope":"single"}}],"action_type":"...","confidence":0.0,"requires_confirmation":false,"confirmation_kind":"none|confirm_action|choose_candidate|clarify","assistant_message":"...","target":{...},"create":{...},"edit":{...}}
 
 Rules:
-- Use actions only for execution plans. One action per separate create/edit/delete operation.
-- Multiple timed reminders in one sentence:
-  - If the user asks for two or more separate reminders/events at different times, you MUST return an actions array with one createReminder or createEvent per timed item.
-  - NEVER collapse multiple timed reminders into a single top-level createReminder/createEvent. The top-level create block can hold only the first item for backward compatibility; every item must also appear in actions[].
-  - Comma-separated Chinese commands with two clock times are almost always two separate creates, not one combined task.
-  - Examples that MUST return two createReminder actions:
-    "九点给艾瑞做早餐，十一点给艾瑞接回家。"
-    "提醒我周二早晨八点给艾瑞做早餐,十一点五十给艾瑞接回来。"
-    "提醒我六点做晚餐,七点陪艾瑞玩儿。"
-    "Remind me at 6 to make dinner and at 7 to play with Ari."
-- Examples:
-  "Remind me tomorrow at 11 to call mom and also remind me to buy tomatoes." => two createReminder actions.
-  "Change this to tomorrow at 11 and add a note to buy vegetables." => reschedule active task, then appendToTask on the same task.
-  "Change this to tomorrow at 11 and remind me to buy vegetables." => reschedule active task, then createReminder for buy vegetables with scheduled_at null.
-  "Change this to tomorrow at 11 and buy vegetables." => requires_confirmation true, confirmation_kind "clarify", ask whether to add it as a note or create a separate reminder.
-  "Change it to 11:30pm and I'll bring my cup to my room." => reschedule active task, then appendToTask with "bring my cup to my room".
-  "Change it to 11:30pm and remember to bring my cup to my room." => reschedule active task, then appendToTask with "bring my cup to my room".
-  "把这个改到明天十一点，备注里加上买菜西红柿土豆" => reschedule active task, then appendToTask.
-  "把这个改到明天十一点，买菜西红柿土豆也提醒我" => reschedule active task, then createReminder with scheduled_at null unless a separate time is given.
-  "把这个改到明天十一点，买菜" => requires_confirmation true, confirmation_kind "clarify", ask whether to add it as a note or create a separate reminder.
-  "九点给艾瑞做早餐，十一点给艾瑞接回家。" => two createReminder actions, one at 09:00 and one at 11:00.
-  "提醒我周二早晨八点给艾瑞做早餐,十一点五十给艾瑞接回来。" => two createReminder actions: breakfast at 08:00, pickup at 11:50.
-  "提醒我六点做晚餐,七点陪艾瑞玩儿。" => two createReminder actions: dinner at 18:00, play at 19:00.
-- Use create.* only for createReminder/createEvent.
-- Use target.* and edit.* only for edit actions.
-- Do not mix target title and new title. new_title is only for explicit rename/title changes.
-- "改成 + time", "改到 + time", "换到 + time" means rescheduleTask, NOT renameTask.
-  Examples: "把这个改成四点半", "把给艾瑞喂水果酸奶的任务改成四点半", "改到下午四点半", "换到明天九点".
-  Set edit.new_scheduled_at and keep edit.new_title null.
-- Rename only when user explicitly says 改名, 名字改成, 标题改成, rename, or change the name/title to.
-- If user says this/it/这个/这个任务/它 and active_task is present, use target.resolution="active_task" and active_task.id.
-- If user names a task, choose from candidate_tasks only. Understand Chinese ASR variants, partial references, and semantic matches:
-  "接阿里" may refer to "去接阿瑞"; "水果酸奶" may refer to "给艾瑞喂芒果酸奶".
-- If uncertain but one likely candidate exists, use requires_confirmation=true, confirmation_kind="confirm_action".
-- If multiple candidates are plausible, use target.resolution="ambiguous", confirmation_kind="choose_candidate", and return top 2-3 candidate_ids.
-- Never invent a task ID. IDs must come from active_task or candidate_tasks.
-- If required fields are missing or intent is unclear, action_type="unknown", confirmation_kind="clarify".
-- Delete should usually require confirmation unless confidence is very high and active_task was explicitly referenced.
-- For weekly recurrence creates, set create.recurrence_type="weekly" and ISO weekdays Monday=1...Sunday=7.
-- For alert style, use only "normal" or "important". Map silent/default/普通/静音/no sound to "normal"; important/loud/重要提醒/明显一点/声音大一点 to "important".
-- For create commands, put alert style in create.alert_style when specified.
-- For existing task alert edits such as "把这个任务改成重要提醒", use action_type="updateAlertStyle" and put the value in edit.alert_style.
-- Do not call Important a true alarm or imply it can bypass Silent Mode or Focus.
-- Always resolve relative times from Current time and Timezone. Use ISO 8601 datetimes with timezone offset.
+- One action per separate create/edit/delete. Use create.* only for createReminder/createEvent; use target.* and edit.* only for edits.
+- Multiple timed reminders/events in one sentence => one createReminder/createEvent per timed item in actions[]. NEVER collapse them into one create. Top-level create may hold only the first item.
+- Comma-separated Chinese with two clock times is usually two separate creates.
+- reschedule + note/detail => rescheduleTask then appendToTask on the same task.
+- reschedule + separate reminder => rescheduleTask then createReminder with scheduled_at null unless a separate time is given.
+- 改成/改到/换到 + time => rescheduleTask with edit.new_scheduled_at; NOT renameTask.
+- Rename only for explicit 改名/标题改成/rename/change the name/title to.
+- this/it/这个/它 + active_task present => target.resolution="active_task" with active_task.id.
+- Named task => choose from candidate_tasks only. Tolerate ASR variants and partial refs ("接阿里" => "去接阿瑞").
+- Never invent task IDs. If unclear, action_type="unknown" and confirmation_kind="clarify".
+- Delete usually needs confirmation unless confidence is very high with explicit active-task reference.
+- Weekly recurrence: recurrence_type="weekly", weekdays Monday=1..Sunday=7.
+- Alert style only "normal" or "important". Do not imply bypassing Silent Mode/Focus.
+- Resolve relative times from current_time and timezone. Use ISO 8601 datetimes with timezone offset.
+
+Examples:
+- "Change this to tomorrow at 11 and add a note to buy vegetables." => reschedule active task, appendToTask.
+- "Change this to tomorrow at 11 and remind me to buy vegetables." => reschedule, then createReminder with null scheduled_at.
+- "Change it to 11:30pm and I'll bring my cup to my room." => reschedule, appendToTask.
+- "九点给艾瑞做早餐，十一点给艾瑞接回家。" => two createReminder actions at 09:00 and 11:00.
+- "提醒我周二早晨八点给艾瑞做早餐,十一点五十给艾瑞接回来。" => two createReminder actions at 08:00 and 11:50.
+- "把给艾瑞喂水果酸奶的任务改成四点半" => rescheduleTask on matched candidate.
 
 Respond with valid JSON only."""
 
@@ -241,6 +173,16 @@ def _auth_headers() -> dict[str, str]:
     if not OPENAI_API_KEY:
         raise ValueError("OPENAI_API_KEY is not set")
     return {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+
+
+_openai_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_openai_client() -> httpx.AsyncClient:
+    global _openai_client
+    if _openai_client is None or _openai_client.is_closed:
+        _openai_client = httpx.AsyncClient(timeout=30.0)
+    return _openai_client
 
 
 def _normalize_action_type(raw: Optional[Any]) -> str:
@@ -283,6 +225,23 @@ def _coerce_optional_str(v: Any) -> Optional[str]:
         t = v.strip()
         return t if t else None
     return str(v)
+
+
+def _slim_interpret_task(task: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Keep only fields the interpreter needs for target disambiguation."""
+    if not task:
+        return None
+    slim: dict[str, Any] = {
+        "id": task.get("id"),
+        "title": task.get("title"),
+        "scheduled_at": task.get("scheduled_at"),
+    }
+    if task.get("is_recurring"):
+        slim["is_recurring"] = True
+        label = _coerce_optional_str(task.get("recurrence_label"))
+        if label:
+            slim["recurrence_label"] = label
+    return {key: value for key, value in slim.items() if value is not None}
 
 
 def _coerce_optional_bool(v: Any) -> Optional[bool]:
@@ -938,23 +897,27 @@ async def interpret_command(
         "current_time": now,
         "timezone": timezone,
         "locale": locale,
-        "active_task": active_task,
-        "candidate_tasks": candidate_tasks,
+        "active_task": _slim_interpret_task(active_task),
+        "candidate_tasks": [
+            slim for task in candidate_tasks if (slim := _slim_interpret_task(task))
+        ],
     }
-    user_json = json.dumps(user_payload, ensure_ascii=False)
+    user_json = json.dumps(user_payload, ensure_ascii=False, separators=(",", ":"))
     prompt_chars = len(COMMAND_INTERPRETER_PROMPT) + len(user_json)
     prompt_build_ms = (time.perf_counter() - route_t0) * 1000
     logger.info(
-        "interpret promptBuilt request_id=%s promptBuildMs=%.1f promptChars=%s promptTokenEstimate=%s candidateTaskCount=%s sendsFullHistory=false",
+        "interpret promptBuilt request_id=%s promptBuildMs=%.1f promptChars=%s promptTokenEstimate=%s candidateTaskCount=%s slimmedCandidateCount=%s sendsFullHistory=false",
         request_id,
         prompt_build_ms,
         prompt_chars,
         estimate_tokens_from_chars(prompt_chars),
         len(candidate_tasks),
+        len(user_payload["candidate_tasks"]),
     )
     payload = {
-        "model": OPENAI_PARSE_MODEL,
+        "model": OPENAI_INTERPRET_MODEL,
         "temperature": 0,
+        "max_tokens": OPENAI_INTERPRET_MAX_TOKENS,
         "messages": [
             {"role": "system", "content": COMMAND_INTERPRETER_PROMPT},
             {"role": "user", "content": user_json},
@@ -962,16 +925,15 @@ async def interpret_command(
         "response_format": {"type": "json_object"},
     }
     openai_t0 = time.perf_counter()
-    logger.info("interpret openAILLMStart request_id=%s model=%s", request_id, OPENAI_PARSE_MODEL)
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
-            f"{OPENAI_BASE_URL}/chat/completions",
-            headers=headers,
-            json=payload,
-        )
+    logger.info("interpret openAILLMStart request_id=%s model=%s maxTokens=%s", request_id, OPENAI_INTERPRET_MODEL, OPENAI_INTERPRET_MAX_TOKENS)
+    response = await _get_openai_client().post(
+        f"{OPENAI_BASE_URL}/chat/completions",
+        headers=headers,
+        json=payload,
+    )
     openai_ms = (time.perf_counter() - openai_t0) * 1000
     if response.status_code != 200:
-        logger.error("OpenAI command interpretation error %s: %s model=%s", response.status_code, response.text, OPENAI_PARSE_MODEL)
+        logger.error("OpenAI command interpretation error %s: %s model=%s", response.status_code, response.text, OPENAI_INTERPRET_MODEL)
         response.raise_for_status()
     raw_content = response.json()["choices"][0]["message"]["content"]
     json_t0 = time.perf_counter()
@@ -987,13 +949,14 @@ async def interpret_command(
     actions_count = len(result.actions or [])
     total_ms = (time.perf_counter() - route_t0) * 1000
     logger.info(
-        "interpret totalInterpretMs=%.1f openAILLMMs=%.1f jsonParseMs=%.1f request_id=%s command_session_id=%s model=%s",
+        "interpret totalInterpretMs=%.1f openAILLMMs=%.1f jsonParseMs=%.1f request_id=%s command_session_id=%s model=%s maxTokens=%s",
         total_ms,
         openai_ms,
         json_parse_ms,
         request_id,
         command_session_id,
-        OPENAI_PARSE_MODEL,
+        OPENAI_INTERPRET_MODEL,
+        OPENAI_INTERPRET_MAX_TOKENS,
     )
     logger.info(
         "interpretResult action_type=%s confidence=%s requires_confirmation=%s target_resolution=%s selected_id=%s actions_count=%s",

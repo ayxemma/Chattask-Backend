@@ -2,7 +2,7 @@ import logging
 
 from fastapi import APIRouter, HTTPException, Request
 
-from app.config import OPENAI_API_KEY, OPENAI_PARSE_MODEL
+from app.config import OPENAI_API_KEY, OPENAI_INTERPRET_MODEL
 from app.models.parse_models import CommandInterpretRequest, CommandInterpretResponse
 from app.services.openai_service import interpret_command
 from app.util.request_timing import TimingSpan, correlation_from_headers
@@ -24,7 +24,7 @@ async def interpret_command_route(request: Request, body: CommandInterpretReques
         correlation.command_session_id,
         len(body.candidate_tasks),
         correlation.likely_cold_start,
-        OPENAI_PARSE_MODEL,
+        OPENAI_INTERPRET_MODEL,
     )
 
     if not OPENAI_API_KEY:
@@ -53,6 +53,6 @@ async def interpret_command_route(request: Request, body: CommandInterpretReques
     span.log(
         candidateTaskCount=len(body.candidate_tasks),
         totalInterpretMs=f"{span.elapsed_ms():.1f}",
-        model=OPENAI_PARSE_MODEL,
+        model=OPENAI_INTERPRET_MODEL,
     )
     return result
