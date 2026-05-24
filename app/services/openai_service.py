@@ -190,6 +190,15 @@ Schema:
 
 Rules:
 - Use actions only for execution plans. One action per separate create/edit/delete operation.
+- Multiple timed reminders in one sentence:
+  - If the user asks for two or more separate reminders/events at different times, you MUST return an actions array with one createReminder or createEvent per timed item.
+  - NEVER collapse multiple timed reminders into a single top-level createReminder/createEvent. The top-level create block can hold only the first item for backward compatibility; every item must also appear in actions[].
+  - Comma-separated Chinese commands with two clock times are almost always two separate creates, not one combined task.
+  - Examples that MUST return two createReminder actions:
+    "九点给艾瑞做早餐，十一点给艾瑞接回家。"
+    "提醒我周二早晨八点给艾瑞做早餐,十一点五十给艾瑞接回来。"
+    "提醒我六点做晚餐,七点陪艾瑞玩儿。"
+    "Remind me at 6 to make dinner and at 7 to play with Ari."
 - Examples:
   "Remind me tomorrow at 11 to call mom and also remind me to buy tomatoes." => two createReminder actions.
   "Change this to tomorrow at 11 and add a note to buy vegetables." => reschedule active task, then appendToTask on the same task.
@@ -201,6 +210,8 @@ Rules:
   "把这个改到明天十一点，买菜西红柿土豆也提醒我" => reschedule active task, then createReminder with scheduled_at null unless a separate time is given.
   "把这个改到明天十一点，买菜" => requires_confirmation true, confirmation_kind "clarify", ask whether to add it as a note or create a separate reminder.
   "九点给艾瑞做早餐，十一点给艾瑞接回家。" => two createReminder actions, one at 09:00 and one at 11:00.
+  "提醒我周二早晨八点给艾瑞做早餐,十一点五十给艾瑞接回来。" => two createReminder actions: breakfast at 08:00, pickup at 11:50.
+  "提醒我六点做晚餐,七点陪艾瑞玩儿。" => two createReminder actions: dinner at 18:00, play at 19:00.
 - Use create.* only for createReminder/createEvent.
 - Use target.* and edit.* only for edit actions.
 - Do not mix target title and new title. new_title is only for explicit rename/title changes.
@@ -543,9 +554,102 @@ def _expand_compound_interpret_action(action: CommandInterpretAction) -> list[Co
     return [action]
 
 
-def _sanitize_interpret_response(data: dict[str, Any], allowed_ids: set[str], active_id: Optional[str]) -> CommandInterpretResponse:
+_MULTI_CREATE_EDIT_MARKERS = (
+    "改成",
+    "改到",
+    "换到",
+    "把这个改",
+    "把这改",
+    "change this to",
+    "move this to",
+    "reschedule",
+)
+
+_TIME_ANCHOR_PATTERNS = (
+    re.compile(r"\d{1,2}\s*[：:]\s*\d{1,2}"),  # 11:50, 8:00
+    re.compile(r"(?:[零一二三四五六七八九十两]|\d{1,2})\s*点(?:[零一二三四五六七八九十两\d]{1,2}分?|\d{1,2}分?)?"),
+)
+
+
+def _count_likely_time_anchors(text: str) -> int:
+    """Rough count of distinct clock-time phrases — used to detect dropped multi-create."""
+    if not text.strip():
+        return 0
+    matches: list[tuple[int, int]] = []
+    for pattern in _TIME_ANCHOR_PATTERNS:
+        for match in pattern.finditer(text):
+            matches.append(match.span())
+    if not matches:
+        return 0
+    matches.sort()
+    merged: list[tuple[int, int]] = []
+    for start, end in matches:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return len(merged)
+
+
+def _looks_like_multi_timed_create(text: str) -> bool:
+    """True when input likely requests two+ separate timed reminders."""
+    trimmed = text.strip()
+    if not trimmed:
+        return False
+    lower = trimmed.lower()
+    if any(marker in trimmed for marker in _MULTI_CREATE_EDIT_MARKERS):
+        return False
+    if "提醒" not in trimmed and "remind" not in lower:
+        return False
+    return _count_likely_time_anchors(trimmed) >= 2
+
+
+def _action_from_response(response: CommandInterpretResponse) -> CommandInterpretAction:
+    return CommandInterpretAction(
+        action_type=response.action_type,
+        confidence=response.confidence,
+        requires_confirmation=response.requires_confirmation,
+        confirmation_kind=response.confirmation_kind,
+        assistant_message=response.assistant_message,
+        target=response.target.model_copy() if response.target else None,
+        create=response.create.model_copy() if response.create else None,
+        edit=response.edit.model_copy() if response.edit else None,
+    )
+
+
+def _count_create_actions(response: CommandInterpretResponse) -> int:
+    create_types = {"createReminder", "createEvent"}
+    if response.actions:
+        return sum(1 for action in response.actions if action.action_type in create_types)
+    if response.action_type in create_types:
+        return 1
+    return 0
+
+
+def _mirror_first_action_to_top_level(response: CommandInterpretResponse) -> None:
+    if not response.actions:
+        return
+    first = response.actions[0]
+    response.action_type = first.action_type
+    response.confidence = first.confidence
+    response.requires_confirmation = any(action.requires_confirmation for action in response.actions)
+    response.confirmation_kind = (
+        "clarify"
+        if any(action.requires_confirmation and action.confirmation_kind == "clarify" for action in response.actions)
+        else first.confirmation_kind
+    )
+    response.target = first.target
+    response.create = first.create
+    response.edit = first.edit
+
+
+def _sanitize_interpret_response(
+    data: dict[str, Any],
+    allowed_ids: set[str],
+    active_id: Optional[str],
+    user_text: Optional[str] = None,
+) -> CommandInterpretResponse:
     response = CommandInterpretResponse.model_validate(data)
-    _sanitize_interpret_action(response, allowed_ids, active_id)
 
     if response.actions:
         expanded_actions: list[CommandInterpretAction] = []
@@ -554,25 +658,31 @@ def _sanitize_interpret_response(data: dict[str, Any], allowed_ids: set[str], ac
                 continue
             sanitized = _sanitize_interpret_action(action, allowed_ids, active_id)
             expanded_actions.extend(_expand_compound_interpret_action(sanitized))
-        response.actions = expanded_actions
-        if response.actions:
-            first = response.actions[0]
-            response.action_type = first.action_type
-            response.confidence = first.confidence
-            response.requires_confirmation = any(action.requires_confirmation for action in response.actions)
-            response.confirmation_kind = (
-                "clarify"
-                if any(action.requires_confirmation and action.confirmation_kind == "clarify" for action in response.actions)
-                else first.confirmation_kind
-            )
-            response.target = first.target
-            response.create = first.create
-            response.edit = first.edit
+        response.actions = expanded_actions or None
     else:
-        expanded_actions = _expand_compound_interpret_action(response)
-        if len(expanded_actions) > 1:
-            response.actions = expanded_actions
-            response.requires_confirmation = any(action.requires_confirmation for action in expanded_actions)
+        top = _action_from_response(response)
+        sanitized_top = _sanitize_interpret_action(top, allowed_ids, active_id)
+        response.action_type = sanitized_top.action_type
+        response.confidence = sanitized_top.confidence
+        response.requires_confirmation = sanitized_top.requires_confirmation
+        response.confirmation_kind = sanitized_top.confirmation_kind
+        response.target = sanitized_top.target
+        response.create = sanitized_top.create
+        response.edit = sanitized_top.edit
+        response.actions = _expand_compound_interpret_action(sanitized_top)
+
+    _mirror_first_action_to_top_level(response)
+
+    if user_text and _looks_like_multi_timed_create(user_text):
+        create_count = _count_create_actions(response)
+        if create_count < 2:
+            logger.warning(
+                "interpretWarnings multiCreateExpectedButSingleActionReturned userText=%s actions_count=%s create_count=%s",
+                user_text,
+                len(response.actions or []),
+                create_count,
+            )
+
     return response
 
 
@@ -873,7 +983,7 @@ async def interpret_command(
     json_parse_ms = (time.perf_counter() - json_t0) * 1000
     if not isinstance(data, dict):
         raise ValueError("Model returned JSON that is not an object")
-    result = _sanitize_interpret_response(data, allowed_ids, active_id)
+    result = _sanitize_interpret_response(data, allowed_ids, active_id, user_text=text)
     actions_count = len(result.actions or [])
     total_ms = (time.perf_counter() - route_t0) * 1000
     logger.info(

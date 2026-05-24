@@ -9,7 +9,10 @@ from app.models.parse_models import (
     CommandInterpretResponse,
     CommandInterpretTarget,
 )
-from app.services.openai_service import _sanitize_interpret_response
+from app.services.openai_service import (
+    _looks_like_multi_timed_create,
+    _sanitize_interpret_response,
+)
 
 
 VALID_PAYLOAD = {
@@ -202,3 +205,105 @@ def test_interpret_command_promotes_multi_action_clarification_kind():
 def test_interpret_command_rejects_empty_text(client: TestClient):
     response = client.post("/interpret-command", json={**VALID_PAYLOAD, "text": "   "})
     assert response.status_code == 400
+
+
+def test_sanitize_promotes_top_level_single_create_to_actions():
+    result = _sanitize_interpret_response(
+        {
+            "action_type": "createReminder",
+            "confidence": 0.95,
+            "requires_confirmation": False,
+            "confirmation_kind": "none",
+            "create": {
+                "title": "喝水",
+                "scheduled_at": "2026-05-17T12:10:00-04:00",
+                "has_specific_time": True,
+            },
+        },
+        allowed_ids=set(),
+        active_id=None,
+    )
+    assert result.actions is not None
+    assert len(result.actions) == 1
+    assert result.actions[0].action_type == "createReminder"
+    assert result.actions[0].create.title == "喝水"
+
+
+def test_sanitize_preserves_dual_create_actions():
+    result = _sanitize_interpret_response(
+        {
+            "action_type": "createReminder",
+            "confidence": 0.95,
+            "requires_confirmation": False,
+            "confirmation_kind": "none",
+            "create": {
+                "title": "给艾瑞做早餐",
+                "scheduled_at": "2026-05-26T08:00:00-04:00",
+                "has_specific_time": True,
+            },
+            "actions": [
+                {
+                    "action_type": "createReminder",
+                    "confidence": 0.95,
+                    "requires_confirmation": False,
+                    "confirmation_kind": "none",
+                    "create": {
+                        "title": "给艾瑞做早餐",
+                        "scheduled_at": "2026-05-26T08:00:00-04:00",
+                        "has_specific_time": True,
+                    },
+                },
+                {
+                    "action_type": "createReminder",
+                    "confidence": 0.93,
+                    "requires_confirmation": False,
+                    "confirmation_kind": "none",
+                    "create": {
+                        "title": "给艾瑞接回家",
+                        "scheduled_at": "2026-05-26T11:50:00-04:00",
+                        "has_specific_time": True,
+                    },
+                },
+            ],
+        },
+        allowed_ids=set(),
+        active_id=None,
+        user_text="提醒我周二早晨八点给艾瑞做早餐,十一点五十给艾瑞接回来。",
+    )
+    assert result.actions is not None
+    assert len(result.actions) == 2
+    assert result.actions[0].create.title == "给艾瑞做早餐"
+    assert result.actions[1].create.title == "给艾瑞接回家"
+
+
+def test_looks_like_multi_timed_create_heuristics():
+    assert _looks_like_multi_timed_create("提醒我六点做晚餐,七点陪艾瑞玩儿。")
+    assert _looks_like_multi_timed_create("提醒我周二早晨八点给艾瑞做早餐,十一点五十给艾瑞接回来。")
+    assert not _looks_like_multi_timed_create("把这个改成四点半,并把酸奶和水果带进去。")
+    assert not _looks_like_multi_timed_create("提醒我十分钟后喝水。")
+
+
+def test_sanitize_logs_warning_when_multi_create_likely_dropped(caplog):
+    import logging
+
+    caplog.set_level(logging.WARNING)
+    _sanitize_interpret_response(
+        {
+            "action_type": "createReminder",
+            "confidence": 0.95,
+            "requires_confirmation": False,
+            "confirmation_kind": "none",
+            "create": {
+                "title": "给艾瑞做早餐",
+                "scheduled_at": "2026-05-26T08:00:00-04:00",
+                "has_specific_time": True,
+            },
+        },
+        allowed_ids=set(),
+        active_id=None,
+        user_text="提醒我周二早晨八点给艾瑞做早餐,十一点五十给艾瑞接回来。",
+    )
+    assert any(
+        "multiCreateExpectedButSingleActionReturned" in record.message
+        for record in caplog.records
+    )
