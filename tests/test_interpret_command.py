@@ -57,6 +57,7 @@ def test_interpret_command_forwards_payload(client: TestClient):
         active_task=None,
         candidate_tasks=VALID_PAYLOAD["candidate_tasks"],
         request_id="trace-interpret-1",
+        command_session_id=None,
     )
 
 

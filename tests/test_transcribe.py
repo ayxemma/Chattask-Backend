@@ -23,7 +23,7 @@ def test_transcribe_returns_text(client: TestClient):
     with patch(
         "app.routes.transcribe.transcribe_audio",
         new_callable=AsyncMock,
-        return_value=TRANSCRIPT,
+        return_value=(TRANSCRIPT, 0),
     ):
         response = client.post("/transcribe", files=_audio_upload())
 
@@ -33,7 +33,7 @@ def test_transcribe_returns_text(client: TestClient):
 
 def test_transcribe_calls_service_with_bytes(client: TestClient):
     """Verifies bytes, filename, and content-type are forwarded to the service."""
-    mock_fn = AsyncMock(return_value=TRANSCRIPT)
+    mock_fn = AsyncMock(return_value=(TRANSCRIPT, 0))
     with patch("app.routes.transcribe.transcribe_audio", new=mock_fn):
         client.post("/transcribe", files=_audio_upload(filename="voice.m4a", mime="audio/x-m4a"))
 
@@ -48,7 +48,7 @@ def test_transcribe_accepts_wav(client: TestClient):
     with patch(
         "app.routes.transcribe.transcribe_audio",
         new_callable=AsyncMock,
-        return_value="hello",
+        return_value=("hello", 0),
     ):
         response = client.post("/transcribe", files=_audio_upload(mime="audio/wav", filename="clip.wav"))
     assert response.status_code == 200

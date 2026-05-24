@@ -40,6 +40,7 @@ class ParseRequest(BaseModel):
     locale: Optional[str] = None  # BCP 47 / Apple identifier from client (parsing + language_code hints)
     parse_instructions: Optional[str] = None  # Short client hints; merged into system prompt on server (not a full prompt)
     request_id: Optional[str] = None  # Correlation id only (optional JSON field `request_id` from app)
+    command_session_id: Optional[str] = None  # End-to-end voice command trace id from app
 
     # Optional input modality for the model (typed vs voice); safe telemetry-style context only.
     source: Optional[str] = Field(
@@ -142,6 +143,7 @@ class CommandInterpretRequest(BaseModel):
     active_task: Optional[CommandInterpretActiveTask] = None
     candidate_tasks: list[TaskTargetCandidate] = []
     request_id: Optional[str] = None
+    command_session_id: Optional[str] = None
 
 
 class CommandInterpretTarget(BaseModel):

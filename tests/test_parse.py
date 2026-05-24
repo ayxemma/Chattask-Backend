@@ -62,6 +62,8 @@ def test_parse_calls_service_with_correct_args(client: TestClient):
         active_task_scheduled_at=None,
         active_task_notes=None,
         active_task_recurrence=None,
+        request_id=None,
+        command_session_id=None,
     )
 
 
@@ -134,10 +136,9 @@ def test_parse_forwards_optional_client_context(client: TestClient):
         active_task_scheduled_at=None,
         active_task_notes=None,
         active_task_recurrence=None,
+        request_id="trace-1",
+        command_session_id=None,
     )
-
-
-def test_parse_forwards_active_task_snapshot(client: TestClient):
     payload = {
         **VALID_PAYLOAD,
         "last_active_task_id": "550e8400-e29b-41d4-a716-446655440000",
@@ -172,6 +173,8 @@ def test_parse_forwards_active_task_snapshot(client: TestClient):
             "time": "11:50",
             "timezone": "America/New_York",
         },
+        request_id=None,
+        command_session_id=None,
     )
 
 

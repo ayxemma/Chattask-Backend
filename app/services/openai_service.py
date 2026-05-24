@@ -576,11 +576,12 @@ def _sanitize_interpret_response(data: dict[str, Any], allowed_ids: set[str], ac
     return response
 
 
-async def transcribe_audio(file_bytes: bytes, filename: str, content_type: str) -> str:
+async def transcribe_audio(file_bytes: bytes, filename: str, content_type: str) -> tuple[str, int]:
     """
-    Send audio bytes to OpenAI's audio transcription endpoint and return the transcript text.
+    Send audio bytes to OpenAI's audio transcription endpoint and return (transcript, retry_count).
     """
     headers = _auth_headers()
+    retries = 0
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         response = await client.post(
@@ -591,11 +592,11 @@ async def transcribe_audio(file_bytes: bytes, filename: str, content_type: str) 
         )
 
     if response.status_code != 200:
-        logger.error("OpenAI transcription error %s: %s", response.status_code, response.text)
+        logger.error("OpenAI transcription error %s: %s model=%s", response.status_code, response.text, OPENAI_TRANSCRIBE_MODEL)
         response.raise_for_status()
 
     result = response.json()
-    return result.get("text", "")
+    return result.get("text", ""), retries
 
 
 def _truncate_notes(s: Optional[str], max_len: int = 1200) -> Optional[str]:
@@ -620,14 +621,20 @@ async def parse_task_text(
     active_task_scheduled_at: Optional[str] = None,
     active_task_notes: Optional[str] = None,
     active_task_recurrence: Optional[dict[str, Any]] = None,
+    request_id: Optional[str] = None,
+    command_session_id: Optional[str] = None,
 ) -> ParseResponse:
     """
     Send task text to OpenAI chat completions and return structured ParseResponse (iOS contract).
     """
+    import time
+
+    route_t0 = time.perf_counter()
     headers = {**_auth_headers(), "Content-Type": "application/json"}
 
     system_content = PARSE_SYSTEM_PROMPT
-    if parse_instructions and parse_instructions.strip():
+    has_client_hints = bool(parse_instructions and parse_instructions.strip())
+    if has_client_hints:
         # Client hints are additive; the block above remains authoritative.
         system_content = (
             f"{PARSE_SYSTEM_PROMPT}\n\n---\nClient parsing hints (follow when consistent with rules above):\n"
@@ -660,6 +667,21 @@ async def parse_task_text(
             user_lines.append(f"- notes (may be truncated): {notes_ctx}")
     user_message = "\n".join(user_lines)
 
+    prompt_build_ms = (time.perf_counter() - route_t0) * 1000
+    prompt_chars = len(system_content) + len(user_message)
+    from app.util.request_timing import estimate_tokens_from_chars
+
+    logger.info(
+        "parse promptBuilt request_id=%s command_session_id=%s promptBuildMs=%.1f promptChars=%s promptTokenEstimate=%s hasClientHints=%s sendsActiveTaskContext=%s",
+        request_id,
+        command_session_id,
+        prompt_build_ms,
+        prompt_chars,
+        estimate_tokens_from_chars(prompt_chars),
+        has_client_hints,
+        bool(last_active_task_id),
+    )
+
     payload = {
         "model": OPENAI_PARSE_MODEL,
         "temperature": 0,
@@ -670,29 +692,45 @@ async def parse_task_text(
         "response_format": {"type": "json_object"},
     }
 
+    openai_t0 = time.perf_counter()
+    logger.info("parse openAILLMStart request_id=%s model=%s", request_id, OPENAI_PARSE_MODEL)
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(
             f"{OPENAI_BASE_URL}/chat/completions",
             headers=headers,
             json=payload,
         )
+    openai_ms = (time.perf_counter() - openai_t0) * 1000
 
     if response.status_code != 200:
-        logger.error("OpenAI parse error %s: %s", response.status_code, response.text)
+        logger.error("OpenAI parse error %s: %s model=%s", response.status_code, response.text, OPENAI_PARSE_MODEL)
         response.raise_for_status()
 
     raw_content = response.json()["choices"][0]["message"]["content"]
 
+    json_t0 = time.perf_counter()
     try:
         data = json.loads(raw_content)
     except json.JSONDecodeError as e:
         logger.error("Failed to decode OpenAI JSON response: %s\nRaw: %s", e, raw_content)
         raise ValueError(f"Model returned invalid JSON: {e}") from e
+    json_parse_ms = (time.perf_counter() - json_t0) * 1000
 
     if not isinstance(data, dict):
         raise ValueError("Model returned JSON that is not an object")
 
-    return _parse_response_from_llm_dict(data)
+    result = _parse_response_from_llm_dict(data)
+    total_ms = (time.perf_counter() - route_t0) * 1000
+    logger.info(
+        "parse totalInterpretMs=%.1f openAILLMMs=%.1f jsonParseMs=%.1f request_id=%s command_session_id=%s model=%s",
+        total_ms,
+        openai_ms,
+        json_parse_ms,
+        request_id,
+        command_session_id,
+        OPENAI_PARSE_MODEL,
+    )
+    return result
 
 
 async def resolve_task_target(
@@ -766,15 +804,21 @@ async def interpret_command(
     active_task: Optional[dict[str, Any]],
     candidate_tasks: list[dict[str, Any]],
     request_id: Optional[str] = None,
+    command_session_id: Optional[str] = None,
 ) -> CommandInterpretResponse:
+    import time
+    from app.util.request_timing import estimate_tokens_from_chars
+
+    route_t0 = time.perf_counter()
     headers = {**_auth_headers(), "Content-Type": "application/json"}
     active_id = _coerce_optional_str((active_task or {}).get("id"))
     allowed_ids = {str(candidate.get("id")) for candidate in candidate_tasks if candidate.get("id")}
     if active_id:
         allowed_ids.add(active_id)
     logger.info(
-        "interpretRequest request_id=%s text=%s candidate_count=%s active_task_present=%s",
+        "interpretRequest request_id=%s command_session_id=%s text=%s candidateTaskCount=%s active_task_present=%s",
         request_id,
+        command_session_id,
         text,
         len(candidate_tasks),
         bool(active_task),
@@ -787,34 +831,60 @@ async def interpret_command(
         "active_task": active_task,
         "candidate_tasks": candidate_tasks,
     }
+    user_json = json.dumps(user_payload, ensure_ascii=False)
+    prompt_chars = len(COMMAND_INTERPRETER_PROMPT) + len(user_json)
+    prompt_build_ms = (time.perf_counter() - route_t0) * 1000
+    logger.info(
+        "interpret promptBuilt request_id=%s promptBuildMs=%.1f promptChars=%s promptTokenEstimate=%s candidateTaskCount=%s sendsFullHistory=false",
+        request_id,
+        prompt_build_ms,
+        prompt_chars,
+        estimate_tokens_from_chars(prompt_chars),
+        len(candidate_tasks),
+    )
     payload = {
         "model": OPENAI_PARSE_MODEL,
         "temperature": 0,
         "messages": [
             {"role": "system", "content": COMMAND_INTERPRETER_PROMPT},
-            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+            {"role": "user", "content": user_json},
         ],
         "response_format": {"type": "json_object"},
     }
+    openai_t0 = time.perf_counter()
+    logger.info("interpret openAILLMStart request_id=%s model=%s", request_id, OPENAI_PARSE_MODEL)
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(
             f"{OPENAI_BASE_URL}/chat/completions",
             headers=headers,
             json=payload,
         )
+    openai_ms = (time.perf_counter() - openai_t0) * 1000
     if response.status_code != 200:
-        logger.error("OpenAI command interpretation error %s: %s", response.status_code, response.text)
+        logger.error("OpenAI command interpretation error %s: %s model=%s", response.status_code, response.text, OPENAI_PARSE_MODEL)
         response.raise_for_status()
     raw_content = response.json()["choices"][0]["message"]["content"]
+    json_t0 = time.perf_counter()
     try:
         data = json.loads(raw_content)
     except json.JSONDecodeError as e:
         logger.error("Failed to decode command interpretation JSON: %s\nRaw: %s", e, raw_content)
         raise ValueError(f"Model returned invalid JSON: {e}") from e
+    json_parse_ms = (time.perf_counter() - json_t0) * 1000
     if not isinstance(data, dict):
         raise ValueError("Model returned JSON that is not an object")
     result = _sanitize_interpret_response(data, allowed_ids, active_id)
     actions_count = len(result.actions or [])
+    total_ms = (time.perf_counter() - route_t0) * 1000
+    logger.info(
+        "interpret totalInterpretMs=%.1f openAILLMMs=%.1f jsonParseMs=%.1f request_id=%s command_session_id=%s model=%s",
+        total_ms,
+        openai_ms,
+        json_parse_ms,
+        request_id,
+        command_session_id,
+        OPENAI_PARSE_MODEL,
+    )
     logger.info(
         "interpretResult action_type=%s confidence=%s requires_confirmation=%s target_resolution=%s selected_id=%s actions_count=%s",
         result.action_type,
