@@ -166,6 +166,38 @@ def test_interpret_command_splits_compound_reschedule_append_action():
     assert result.actions[1].target.selected_task_id == "550e8400-e29b-41d4-a716-446655440000"
 
 
+def test_interpret_command_promotes_multi_action_clarification_kind():
+    result = _sanitize_interpret_response(
+        {
+            "actions": [
+                {
+                    "action_type": "rescheduleTask",
+                    "confidence": 0.9,
+                    "requires_confirmation": False,
+                    "confirmation_kind": "none",
+                    "target": {
+                        "resolution": "active_task",
+                        "selected_task_id": "550e8400-e29b-41d4-a716-446655440000",
+                    },
+                    "edit": {"new_scheduled_at": "2026-05-18T11:00:00-04:00"},
+                },
+                {
+                    "action_type": "createReminder",
+                    "confidence": 0.55,
+                    "requires_confirmation": True,
+                    "confirmation_kind": "clarify",
+                    "assistant_message": "Should I add it as a note or create a reminder?",
+                    "create": {"title": "buy vegetables"},
+                },
+            ]
+        },
+        allowed_ids={"550e8400-e29b-41d4-a716-446655440000"},
+        active_id="550e8400-e29b-41d4-a716-446655440000",
+    )
+    assert result.requires_confirmation is True
+    assert result.confirmation_kind == "clarify"
+
+
 def test_interpret_command_rejects_empty_text(client: TestClient):
     response = client.post("/interpret-command", json={**VALID_PAYLOAD, "text": "   "})
     assert response.status_code == 400

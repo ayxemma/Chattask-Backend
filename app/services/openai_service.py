@@ -135,6 +135,8 @@ Preserve the existing single-action contract:
 - For multiple independent actions in one sentence, return actions with every action in execution order. Also mirror the first action into the top-level fields for backward compatibility.
 - Do not split by keywords mechanically. Decide semantically whether the user means separate actions or one edit.
 - Do not discard trailing details after an edit. If the user edits the active task and then adds a related detail about what they will do/bring/take/remember, return a second appendToTask action unless they explicitly ask for a separate reminder/task.
+- Do not copy an edit time onto a separate new reminder unless the user explicitly gives that time for the reminder. "Change this to tomorrow at 11 and remind me to buy vegetables" creates an untimed buy-vegetables reminder.
+- If a trailing bare phrase after an edit could be either a note or a new reminder, ask for clarification instead of guessing.
 - If the multi-action plan is uncertain, set requires_confirmation=true on the uncertain action(s) or use a clarifying assistant_message.
 - If you cannot produce a valid multi-action plan, return the best single-action interpretation so the original parser can handle fallback safely.
 
@@ -191,11 +193,13 @@ Rules:
 - Examples:
   "Remind me tomorrow at 11 to call mom and also remind me to buy tomatoes." => two createReminder actions.
   "Change this to tomorrow at 11 and add a note to buy vegetables." => reschedule active task, then appendToTask on the same task.
-  "Change this to tomorrow at 11 and remind me to buy vegetables." => reschedule active task, then createReminder for buy vegetables.
+  "Change this to tomorrow at 11 and remind me to buy vegetables." => reschedule active task, then createReminder for buy vegetables with scheduled_at null.
+  "Change this to tomorrow at 11 and buy vegetables." => requires_confirmation true, confirmation_kind "clarify", ask whether to add it as a note or create a separate reminder.
   "Change it to 11:30pm and I'll bring my cup to my room." => reschedule active task, then appendToTask with "bring my cup to my room".
   "Change it to 11:30pm and remember to bring my cup to my room." => reschedule active task, then appendToTask with "bring my cup to my room".
   "把这个改到明天十一点，备注里加上买菜西红柿土豆" => reschedule active task, then appendToTask.
-  "把这个改到明天十一点，买菜西红柿土豆也提醒我" => reschedule active task, then createReminder.
+  "把这个改到明天十一点，买菜西红柿土豆也提醒我" => reschedule active task, then createReminder with scheduled_at null unless a separate time is given.
+  "把这个改到明天十一点，买菜" => requires_confirmation true, confirmation_kind "clarify", ask whether to add it as a note or create a separate reminder.
 - Use create.* only for createReminder/createEvent.
 - Use target.* and edit.* only for edit actions.
 - Do not mix target title and new title. new_title is only for explicit rename/title changes.
@@ -555,7 +559,11 @@ def _sanitize_interpret_response(data: dict[str, Any], allowed_ids: set[str], ac
             response.action_type = first.action_type
             response.confidence = first.confidence
             response.requires_confirmation = any(action.requires_confirmation for action in response.actions)
-            response.confirmation_kind = first.confirmation_kind
+            response.confirmation_kind = (
+                "clarify"
+                if any(action.requires_confirmation and action.confirmation_kind == "clarify" for action in response.actions)
+                else first.confirmation_kind
+            )
             response.target = first.target
             response.create = first.create
             response.edit = first.edit
