@@ -200,6 +200,7 @@ Rules:
   "把这个改到明天十一点，备注里加上买菜西红柿土豆" => reschedule active task, then appendToTask.
   "把这个改到明天十一点，买菜西红柿土豆也提醒我" => reschedule active task, then createReminder with scheduled_at null unless a separate time is given.
   "把这个改到明天十一点，买菜" => requires_confirmation true, confirmation_kind "clarify", ask whether to add it as a note or create a separate reminder.
+  "九点给艾瑞做早餐，十一点给艾瑞接回家。" => two createReminder actions, one at 09:00 and one at 11:00.
 - Use create.* only for createReminder/createEvent.
 - Use target.* and edit.* only for edit actions.
 - Do not mix target title and new title. new_title is only for explicit rename/title changes.
