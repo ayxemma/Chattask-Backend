@@ -148,6 +148,7 @@ Rules:
 - Comma-separated Chinese with two clock times is usually two separate creates.
 - reschedule + note/detail => rescheduleTask then appendToTask on the same task.
 - reschedule + separate reminder => rescheduleTask then createReminder with scheduled_at null unless a separate time is given.
+- reschedule + "提前X分钟提醒我" / "remind me X minutes before" => ONE rescheduleTask on the matched task. Set edit.new_scheduled_at to the new event time and edit.reminder_offset_minutes=X. Do NOT create a second reminder/task.
 - 改成/改到/换到 + time => rescheduleTask with edit.new_scheduled_at; NOT renameTask.
 - Rename only for explicit 改名/标题改成/rename/change the name/title to.
 - this/it/这个/它 + active_task present => target.resolution="active_task" with active_task.id.
@@ -170,6 +171,7 @@ Examples:
 - "把给艾瑞喂水果酸奶的任务改成四点半" => rescheduleTask on matched candidate.
 - "晚上九点的时候提醒我用吸尘器吸一下屋子。" => createReminder title in Chinese e.g. "用吸尘器吸一下屋子", scheduled_at 21:00 local.
 - "把九点的任务改成十点。" => single rescheduleTask matching the 21:00 task, new time 22:00 local, requires_confirmation=false.
+- "把明天下午两点有面试改成两点十分有面试,提前十分钟提醒我。" => single rescheduleTask: new_scheduled_at=14:10, reminder_offset_minutes=10, same matched task. No second createReminder.
 
 Respond with valid JSON only."""
 
@@ -603,6 +605,123 @@ def _infer_input_language(text: str, locale: Optional[str]) -> str:
     return "en"
 
 
+_REMIND_BEFORE_MINUTES = re.compile(
+    r"提前\s*([零一二三四五六七八九十两\d]+)\s*分钟|"
+    r"remind\s+me\s+(\d+)\s+minutes?\s+before",
+    re.IGNORECASE,
+)
+
+
+def _parse_reminder_offset_minutes(text: str) -> Optional[int]:
+    match = _REMIND_BEFORE_MINUTES.search(text)
+    if not match:
+        return None
+    raw = next(group for group in match.groups() if group)
+    raw = raw.strip()
+    if raw.isdigit():
+        return int(raw)
+    if raw == "十":
+        return 10
+    if raw.endswith("十") and len(raw) == 2 and raw[0] in "一二三四五六七八九两":
+        tens = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "两": 2}
+        return tens.get(raw[0], 0) * 10
+    digit_map = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "两": 2}
+    return digit_map.get(raw)
+
+
+def _scheduled_minutes_delta(before_iso: str, after_iso: str) -> Optional[int]:
+    from datetime import datetime
+
+    try:
+        before = datetime.fromisoformat(before_iso.replace("Z", "+00:00"))
+        after = datetime.fromisoformat(after_iso.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return int(round((after - before).total_seconds() / 60))
+
+
+def _looks_like_remind_before_create(
+    reschedule: CommandInterpretAction,
+    follow_up: CommandInterpretAction,
+) -> bool:
+    if follow_up.action_type != "createReminder" or not follow_up.create:
+        return False
+    if not reschedule.edit or not reschedule.edit.new_scheduled_at:
+        return False
+    create_at = follow_up.create.scheduled_at
+    if not create_at:
+        return False
+    delta = _scheduled_minutes_delta(create_at, reschedule.edit.new_scheduled_at)
+    return delta is not None and 0 < delta <= 180
+
+
+def _collapse_reschedule_remind_before_create(
+    actions: list[CommandInterpretAction],
+    user_text: Optional[str],
+) -> list[CommandInterpretAction]:
+    """Merge reschedule + spurious pre-reminder create into one reschedule with offset."""
+    if len(actions) < 2:
+        return actions
+    first, second = actions[0], actions[1]
+    if first.action_type != "rescheduleTask" or second.action_type != "createReminder":
+        return actions
+    if not first.edit or not first.edit.new_scheduled_at:
+        return actions
+
+    offset = _parse_reminder_offset_minutes(user_text or "")
+    has_anchor = _looks_like_remind_before_create(first, second)
+    if offset is None and has_anchor and second.create and second.create.scheduled_at:
+        offset = _scheduled_minutes_delta(second.create.scheduled_at, first.edit.new_scheduled_at)
+    if offset is None or offset <= 0:
+        return actions
+    if _parse_reminder_offset_minutes(user_text or "") is None and not has_anchor:
+        return actions
+
+    first.edit.reminder_offset_minutes = offset
+    logger.info(
+        "interpretWarnings collapsedRescheduleRemindBeforeCreate offsetMinutes=%s actions_before=%s",
+        offset,
+        len(actions),
+    )
+    return [first, *actions[2:]]
+
+
+def _finalize_reschedule_remind_before_actions(
+    actions: list[CommandInterpretAction],
+    user_text: Optional[str],
+) -> list[CommandInterpretAction]:
+    actions = _collapse_reschedule_remind_before_create(actions, user_text)
+    if not actions or actions[0].action_type != "rescheduleTask" or not actions[0].edit:
+        return actions
+
+    remind_before = _parse_reminder_offset_minutes(user_text or "")
+    if actions[0].edit.reminder_offset_minutes:
+        remind_before = actions[0].edit.reminder_offset_minutes
+    elif remind_before:
+        actions[0].edit.reminder_offset_minutes = remind_before
+
+    if remind_before is None or len(actions) == 1:
+        return actions
+
+    kept = [actions[0]]
+    for action in actions[1:]:
+        if action.action_type in ("createReminder", "unknown"):
+            continue
+        if action.action_type == "appendToTask":
+            append_text = action.edit.append_text if action.edit else None
+            if not append_text or not append_text.strip():
+                continue
+        kept.append(action)
+    if len(kept) < len(actions):
+        logger.info(
+            "interpretWarnings droppedFollowupsAfterRescheduleRemindBefore before=%s after=%s offsetMinutes=%s",
+            len(actions),
+            len(kept),
+            remind_before,
+        )
+    return kept
+
+
 def _drop_spurious_clarify_actions(actions: list[CommandInterpretAction]) -> list[CommandInterpretAction]:
     """Remove extra unknown+clarify actions when a confident executable action exists."""
     if len(actions) <= 1:
@@ -679,6 +798,7 @@ def _sanitize_interpret_response(
 
     if response.actions:
         response.actions = _drop_spurious_clarify_actions(response.actions)
+        response.actions = _finalize_reschedule_remind_before_actions(response.actions, user_text)
 
     _mirror_first_action_to_top_level(response)
 

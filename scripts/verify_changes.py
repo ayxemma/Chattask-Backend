@@ -33,6 +33,7 @@ class SmokeCase:
     expect_title_not_english: bool = False
     expect_no_clarify: bool = True
     expect_new_hour: int | None = None  # local hour in new_scheduled_at when set
+    expect_reminder_offset_minutes: int | None = None
 
 
 SMOKE_CASES = [
@@ -103,6 +104,30 @@ SMOKE_CASES = [
         candidate_tasks=[],
         expect_actions=1,
         expect_action_types=["createReminder"],
+    ),
+    SmokeCase(
+        name="reschedule-with-remind-before",
+        text="把明天下午两点有面试改成两点十分有面试,提前十分钟提醒我。",
+        now="2026-05-24T16:00:00-04:00",
+        timezone="America/New_York",
+        locale="zh-Hans",
+        active_task={
+            "id": "922666FD-9152-4CC8-BFE6-9911936DE892",
+            "title": "面试",
+            "scheduled_at": "2026-05-25T18:00:00-04:00",
+            "is_recurring": False,
+        },
+        candidate_tasks=[
+            {
+                "id": "922666FD-9152-4CC8-BFE6-9911936DE892",
+                "title": "面试",
+                "scheduled_at": "2026-05-25T18:00:00-04:00",
+                "is_recurring": False,
+            }
+        ],
+        expect_actions=1,
+        expect_action_types=["rescheduleTask"],
+        expect_reminder_offset_minutes=10,
     ),
 ]
 
@@ -189,6 +214,14 @@ async def run_live_smoke() -> int:
                 ok = False
                 reasons.append(
                     f"new_scheduled_at hour={dt.hour} want {case.expect_new_hour}"
+                )
+
+        if case.expect_reminder_offset_minutes is not None:
+            offset = result.edit.reminder_offset_minutes if result.edit else None
+            if offset != case.expect_reminder_offset_minutes:
+                ok = False
+                reasons.append(
+                    f"reminder_offset_minutes={offset} want {case.expect_reminder_offset_minutes}"
                 )
 
         status = "PASS" if ok else "FAIL"

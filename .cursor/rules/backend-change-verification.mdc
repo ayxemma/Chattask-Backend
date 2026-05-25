@@ -28,6 +28,7 @@ When changing ChatTask backend code, **do not break existing behavior**. Optimiz
 | Reschedule + append | `把四点半...改成四点五十...,并且给Ery带点水` | 2 actions: reschedule + append |
 | Dual create | `八点做早餐,十一点五十接回来` | 2 createReminder actions |
 | Reschedule by hour | `把九点的任务改成十点` | 1 reschedule, no spurious clarify |
+| Reschedule + remind before | `...改成两点十分...,提前十分钟提醒我` | 1 reschedule, reminder_offset_minutes=10 |
 | Simple create | `十分钟后喝水` | 1 createReminder |
 
 ## Prompt / model changes

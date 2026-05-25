@@ -10,10 +10,18 @@ from app.models.parse_models import (
     CommandInterpretTarget,
 )
 from app.services.openai_service import (
+    _collapse_reschedule_remind_before_create,
     _drop_spurious_clarify_actions,
     _infer_input_language,
     _looks_like_multi_timed_create,
+    _parse_reminder_offset_minutes,
     _sanitize_interpret_response,
+)
+from app.models.parse_models import (
+    CommandInterpretAction,
+    CommandInterpretCreate,
+    CommandInterpretEdit,
+    CommandInterpretTarget,
 )
 
 
@@ -348,3 +356,35 @@ def test_sanitize_drops_spurious_unknown_clarify_action():
     assert result.actions[0].action_type == "rescheduleTask"
     assert result.requires_confirmation is False
     assert result.confirmation_kind == "none"
+
+
+def test_parse_reminder_offset_minutes_from_chinese():
+    assert _parse_reminder_offset_minutes("提前十分钟提醒我") == 10
+    assert _parse_reminder_offset_minutes("提前15分钟提醒") == 15
+
+
+def test_collapse_reschedule_remind_before_create():
+    actions = [
+        CommandInterpretAction(
+            action_type="rescheduleTask",
+            confidence=1.0,
+            target=CommandInterpretTarget(
+                resolution="candidate",
+                selected_task_id="922666FD-9152-4CC8-BFE6-9911936DE892",
+            ),
+            edit=CommandInterpretEdit(new_scheduled_at="2026-05-25T18:10:00+00:00"),
+        ),
+        CommandInterpretAction(
+            action_type="createReminder",
+            confidence=1.0,
+            create=CommandInterpretCreate(title="面试", scheduled_at="2026-05-25T18:00:00+00:00"),
+        ),
+    ]
+    collapsed = _collapse_reschedule_remind_before_create(
+        actions,
+        "把明天下午两点有面试改成两点十分有面试,提前十分钟提醒我。",
+    )
+    assert len(collapsed) == 1
+    assert collapsed[0].action_type == "rescheduleTask"
+    assert collapsed[0].edit is not None
+    assert collapsed[0].edit.reminder_offset_minutes == 10
