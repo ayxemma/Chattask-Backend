@@ -168,6 +168,7 @@ class CommandInterpretCreate(BaseModel):
     recurrence_weekdays: Optional[list[int]] = None
     recurrence_end_at: Optional[str] = None
     alert_style: Optional[str] = None
+    reminder_offset_minutes: Optional[int] = None
 
 
 class CommandInterpretEdit(BaseModel):

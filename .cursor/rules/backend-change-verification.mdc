@@ -6,16 +6,17 @@ alwaysApply: true
 
 # Backend change verification
 
-When changing ChatTask backend code, **do not break existing behavior**. Optimizations (prompt size, latency, refactors) must preserve parsing semantics.
+When changing ChatTask backend code, **do not break existing behavior**. See [`docs/CAPABILITIES.md`](../../docs/CAPABILITIES.md) for the action catalog and new-feature checklist.
 
 ## Before finishing any change
 
-1. **Add or update tests** in `tests/` for new or changed behavior. Do not delete passing tests without explicit user approval.
-2. **Run unit tests** (required):
+1. Update **`app/capabilities/interpreter_capabilities.json`** if interpret behavior or fields change.
+2. **Add or update tests** in `tests/`. Do not add semantic repair heuristics in `openai_service.py`.
+3. **Run unit tests** (required):
    ```bash
    cd ChatTask-backend && python3 -m pytest tests/ -q
    ```
-3. **Run live smoke checks** when `.env` has a real `OPENAI_API_KEY`:
+4. **Run live smoke checks** when `.env` has a real `OPENAI_API_KEY`:
    ```bash
    python3 scripts/verify_changes.py --live
    ```
@@ -33,11 +34,12 @@ When changing ChatTask backend code, **do not break existing behavior**. Optimiz
 
 ## Prompt / model changes
 
-- Shorter prompts still need the rules above — verify with `--live`, not just unit tests.
-- If changing `OPENAI_INTERPRET_MODEL`, re-run all smoke scenarios; faster models may drop multi-action quality.
+- Prompt is built from `interpreter_capabilities.json` — keep examples minimal for latency.
+- Verify with `--live`, not just unit tests.
+- If changing `OPENAI_INTERPRET_MODEL`, re-run all smoke scenarios.
 
 ## Do not ship when
 
 - pytest fails
 - live smoke fails on a scenario that worked before your change
-- you removed test coverage for a bug that was recently fixed
+- you added phrase-matching semantic repair instead of catalog + tests

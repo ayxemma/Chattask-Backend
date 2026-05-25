@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "reminder_offset_minutes": [0, 5, 10, 15, 30, 60],
+  "alert_styles": ["normal", "important"],
+  "actions": [
+    {
+      "type": "createReminder",
+      "block": "create",
+      "fields": ["title", "notes", "scheduled_at", "reminder_offset_minutes", "alert_style", "recurrence_type", "recurrence_weekdays"]
+    },
+    {
+      "type": "createEvent",
+      "block": "create",
+      "fields": ["title", "notes", "scheduled_at", "end_at", "alert_style"]
+    },
+    {
+      "type": "rescheduleTask",
+      "block": "edit",
+      "fields": ["target", "new_scheduled_at", "reminder_offset_minutes", "alert_style"]
+    },
+    {
+      "type": "renameTask",
+      "block": "edit",
+      "fields": ["target", "new_title"]
+    },
+    {
+      "type": "appendToTask",
+      "block": "edit",
+      "fields": ["target", "append_text"]
+    },
+    {
+      "type": "deleteTask",
+      "block": "edit",
+      "fields": ["target"]
+    },
+    {
+      "type": "updateRecurrence",
+      "block": "edit",
+      "fields": ["target", "new_recurrence_type", "new_recurrence_weekdays"]
+    },
+    {
+      "type": "updateAlertStyle",
+      "block": "edit",
+      "fields": ["target", "alert_style"]
+    }
+  ],
+  "rules": [
+    "Return one JSON object; actions[] for multi-step; mirror first action at top level.",
+    "Use input_language for title/notes/append_text; never translate to locale.",
+    "Targets: active_task.id, or candidate_tasks only; never invent IDs.",
+    "Multiple clock times => one createReminder/createEvent per time in actions[].",
+    "Reschedule+note => rescheduleTask then appendToTask on same target.",
+    "Reschedule+remind X min before => one rescheduleTask with reminder_offset_minutes=X (not append, not a new task).",
+    "改到/改成+time => rescheduleTask; explicit rename phrasing => renameTask.",
+    "Ambiguous note vs new reminder => confirmation_kind=clarify.",
+    "Times: ISO8601 with offset from current_time+timezone."
+  ],
+  "examples": [
+    "十分钟后喝水 => createReminder",
+    "九点…早餐，十一点…接回家 => 2x createReminder",
+    "改到四点半+带水 => reschedule+append",
+    "改到两点十分,提前十分钟提醒 => reschedule offset=10",
+    "把九点的任务改成十点 => reschedule by hour match"
+  ]
+}

@@ -9,20 +9,8 @@ from app.models.parse_models import (
     CommandInterpretResponse,
     CommandInterpretTarget,
 )
-from app.services.openai_service import (
-    _collapse_reschedule_remind_before_create,
-    _drop_spurious_clarify_actions,
-    _infer_input_language,
-    _looks_like_multi_timed_create,
-    _parse_reminder_offset_minutes,
-    _sanitize_interpret_response,
-)
-from app.models.parse_models import (
-    CommandInterpretAction,
-    CommandInterpretCreate,
-    CommandInterpretEdit,
-    CommandInterpretTarget,
-)
+from app.capabilities.validation import infer_input_language, normalize_reminder_offset_minutes
+from app.services.openai_service import _looks_like_multi_timed_create, _sanitize_interpret_response
 
 
 VALID_PAYLOAD = {
@@ -320,71 +308,31 @@ def test_sanitize_logs_warning_when_multi_create_likely_dropped(caplog):
 
 
 def test_infer_input_language_from_chinese_text():
-    assert _infer_input_language("把九点的任务改成十点。", "en") == "zh"
+    assert infer_input_language("把九点的任务改成十点。", "en") == "zh"
 
 
-def test_sanitize_drops_spurious_unknown_clarify_action():
-    result = _sanitize_interpret_response(
-        {
-            "actions": [
-                {
-                    "action_type": "rescheduleTask",
-                    "confidence": 0.9,
-                    "requires_confirmation": False,
-                    "confirmation_kind": "none",
-                    "target": {
-                        "resolution": "candidate",
-                        "selected_task_id": "550e8400-e29b-41d4-a716-446655440000",
-                    },
-                    "edit": {"new_scheduled_at": "2026-05-24T22:00:00-04:00"},
-                },
-                {
-                    "action_type": "unknown",
-                    "confidence": 0.0,
-                    "requires_confirmation": True,
-                    "confirmation_kind": "clarify",
-                    "assistant_message": "Could you clarify?",
-                },
-            ]
-        },
-        allowed_ids={"550e8400-e29b-41d4-a716-446655440000"},
-        active_id=None,
-        user_text="把九点的任务改成十点。",
-    )
-    assert result.actions is not None
-    assert len(result.actions) == 1
-    assert result.actions[0].action_type == "rescheduleTask"
-    assert result.requires_confirmation is False
-    assert result.confirmation_kind == "none"
+def test_normalize_reminder_offset_minutes_snaps_to_catalog():
+    assert normalize_reminder_offset_minutes(10) == 10
+    assert normalize_reminder_offset_minutes(12) == 10
+    assert normalize_reminder_offset_minutes(7) == 5
 
 
-def test_parse_reminder_offset_minutes_from_chinese():
-    assert _parse_reminder_offset_minutes("提前十分钟提醒我") == 10
-    assert _parse_reminder_offset_minutes("提前15分钟提醒") == 15
+def test_enforce_catalog_composition_remind_before_is_single_action():
+    from app.capabilities.validation import enforce_catalog_composition
+    from app.models.parse_models import CommandInterpretAction, CommandInterpretEdit, CommandInterpretTarget
 
-
-def test_collapse_reschedule_remind_before_create():
     actions = [
         CommandInterpretAction(
             action_type="rescheduleTask",
-            confidence=1.0,
-            target=CommandInterpretTarget(
-                resolution="candidate",
-                selected_task_id="922666FD-9152-4CC8-BFE6-9911936DE892",
-            ),
-            edit=CommandInterpretEdit(new_scheduled_at="2026-05-25T18:10:00+00:00"),
+            edit=CommandInterpretEdit(new_scheduled_at="2026-05-25T18:10:00-04:00", reminder_offset_minutes=10),
+            target=CommandInterpretTarget(resolution="active_task", selected_task_id="abc"),
         ),
         CommandInterpretAction(
-            action_type="createReminder",
-            confidence=1.0,
-            create=CommandInterpretCreate(title="面试", scheduled_at="2026-05-25T18:00:00+00:00"),
+            action_type="appendToTask",
+            edit=CommandInterpretEdit(append_text="有面试"),
+            target=CommandInterpretTarget(resolution="active_task", selected_task_id="abc"),
         ),
     ]
-    collapsed = _collapse_reschedule_remind_before_create(
-        actions,
-        "把明天下午两点有面试改成两点十分有面试,提前十分钟提醒我。",
-    )
-    assert len(collapsed) == 1
-    assert collapsed[0].action_type == "rescheduleTask"
-    assert collapsed[0].edit is not None
-    assert collapsed[0].edit.reminder_offset_minutes == 10
+    result = enforce_catalog_composition(actions)
+    assert len(result) == 1
+    assert result[0].action_type == "rescheduleTask"

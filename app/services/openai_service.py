@@ -13,6 +13,13 @@ from app.config import (
     OPENAI_PARSE_MODEL,
     OPENAI_TRANSCRIBE_MODEL,
 )
+from app.capabilities.prompt import build_interpreter_system_prompt, catalog_version
+from app.capabilities.validation import (
+    drop_invalid_actions,
+    enforce_catalog_composition,
+    infer_input_language,
+    normalize_reminder_offset_minutes,
+)
 from app.models.parse_models import CommandInterpretAction, CommandInterpretResponse, ParseResponse, TaskTargetResolveResponse
 
 logger = logging.getLogger(__name__)
@@ -128,52 +135,7 @@ Rules:
 Respond with valid JSON only."""
 
 
-COMMAND_INTERPRETER_PROMPT = """You are ChatTask's one-shot command interpreter. Return exactly one JSON object matching the schema below. No markdown.
-
-Contract:
-- Single command: fill top-level fields; omit actions or return one matching item.
-- Multiple independent actions: return actions[] in execution order and mirror the first action at top level.
-- Decide semantically; do not split by keywords alone.
-- Do not discard trailing details after an edit. If the user reschedules/renames the active task then adds what they will do/bring/remember, return appendToTask as a second action unless they clearly want a separate reminder.
-- Do not copy an edit time onto a separate new reminder unless the user gives that time for the reminder.
-- If a trailing phrase could be note vs new reminder, set requires_confirmation=true and confirmation_kind="clarify".
-- If uncertain about multi-action structure, return the best single-action plan.
-
-Schema:
-{"actions":[{"action_type":"createReminder|createEvent|rescheduleTask|renameTask|appendToTask|deleteTask|updateRecurrence|updateAlertStyle|unknown","confidence":0.0,"requires_confirmation":false,"confirmation_kind":"none|confirm_action|choose_candidate|clarify","assistant_message":"...","target":{"resolution":"active_task|candidate|ambiguous|none","selected_task_id":null,"selected_task_title":null,"candidate_ids":null,"reason":"..."},"create":{"title":null,"notes":null,"scheduled_at":null,"end_at":null,"has_specific_time":null,"recurrence_type":"none","recurrence_weekdays":null,"recurrence_end_at":null,"alert_style":null},"edit":{"new_title":null,"new_scheduled_at":null,"append_text":null,"new_recurrence_type":null,"new_recurrence_weekdays":null,"alert_style":null,"apply_scope":"single"}}],"action_type":"...","confidence":0.0,"requires_confirmation":false,"confirmation_kind":"none|confirm_action|choose_candidate|clarify","assistant_message":"...","target":{...},"create":{...},"edit":{...}}
-
-Rules:
-- One action per separate create/edit/delete. Use create.* only for createReminder/createEvent; use target.* and edit.* only for edits.
-- Multiple timed reminders/events in one sentence => one createReminder/createEvent per timed item in actions[]. NEVER collapse them into one create. Top-level create may hold only the first item.
-- Comma-separated Chinese with two clock times is usually two separate creates.
-- reschedule + note/detail => rescheduleTask then appendToTask on the same task.
-- reschedule + separate reminder => rescheduleTask then createReminder with scheduled_at null unless a separate time is given.
-- reschedule + "提前X分钟提醒我" / "remind me X minutes before" => ONE rescheduleTask on the matched task. Set edit.new_scheduled_at to the new event time and edit.reminder_offset_minutes=X. Do NOT create a second reminder/task.
-- 改成/改到/换到 + time => rescheduleTask with edit.new_scheduled_at; NOT renameTask.
-- Rename only for explicit 改名/标题改成/rename/change the name/title to.
-- this/it/这个/它 + active_task present => target.resolution="active_task" with active_task.id.
-- Named task => choose from candidate_tasks only. Tolerate ASR variants and partial refs ("接阿里" => "去接阿瑞").
-- Never invent task IDs. If unclear, action_type="unknown" and confirmation_kind="clarify".
-- Delete usually needs confirmation unless confidence is very high with explicit active-task reference.
-- Weekly recurrence: recurrence_type="weekly", weekdays Monday=1..Sunday=7.
-- Alert style only "normal" or "important". Do not imply bypassing Silent Mode/Focus.
-- Resolve relative times from current_time and timezone. Use ISO 8601 datetimes with timezone offset.
-- Language: use input_language from the user JSON (derived from text, not locale). create.title, create.notes, edit.append_text, and assistant_message MUST stay in input_language. Never translate to English or locale language.
-- Reschedule by time reference: "把X点的任务改成Y点" => single rescheduleTask. Match the candidate whose local scheduled hour is X (晚上/九点 => 21:00). Set new_scheduled_at to Y点 preserving evening/morning context (九点改十点 => 22:00, not 10:00). requires_confirmation=false when one clear match.
-- Return only actions you intend to execute. Do NOT add a second unknown/clarify action alongside a confident reschedule/create.
-
-Examples:
-- "Change this to tomorrow at 11 and add a note to buy vegetables." => reschedule active task, appendToTask.
-- "Change this to tomorrow at 11 and remind me to buy vegetables." => reschedule, then createReminder with null scheduled_at.
-- "Change it to 11:30pm and I'll bring my cup to my room." => reschedule, appendToTask.
-- "九点给艾瑞做早餐，十一点给艾瑞接回家。" => two createReminder actions at 09:00 and 11:00.
-- "提醒我周二早晨八点给艾瑞做早餐,十一点五十给艾瑞接回来。" => two createReminder actions at 08:00 and 11:50.
-- "把给艾瑞喂水果酸奶的任务改成四点半" => rescheduleTask on matched candidate.
-- "晚上九点的时候提醒我用吸尘器吸一下屋子。" => createReminder title in Chinese e.g. "用吸尘器吸一下屋子", scheduled_at 21:00 local.
-- "把九点的任务改成十点。" => single rescheduleTask matching the 21:00 task, new time 22:00 local, requires_confirmation=false.
-- "把明天下午两点有面试改成两点十分有面试,提前十分钟提醒我。" => single rescheduleTask: new_scheduled_at=14:10, reminder_offset_minutes=10, same matched task. No second createReminder.
-
-Respond with valid JSON only."""
+INTERPRETER_SYSTEM_PROMPT = build_interpreter_system_prompt()  # module default; interpret_command rebuilds for freshness
 
 
 def _auth_headers() -> dict[str, str]:
@@ -479,8 +441,14 @@ def _sanitize_interpret_action(
 
     if action.create:
         action.create.alert_style = _coerce_alert_style(action.create.alert_style)
+        action.create.reminder_offset_minutes = normalize_reminder_offset_minutes(
+            action.create.reminder_offset_minutes
+        )
     if action.edit:
         action.edit.alert_style = _coerce_alert_style(action.edit.alert_style)
+        action.edit.reminder_offset_minutes = normalize_reminder_offset_minutes(
+            action.edit.reminder_offset_minutes
+        )
 
     if action.confirmation_kind is None:
         action.confirmation_kind = "none" if not action.requires_confirmation else "confirm_action"
@@ -592,165 +560,6 @@ def _count_create_actions(response: CommandInterpretResponse) -> int:
     return 0
 
 
-def _infer_input_language(text: str, locale: Optional[str]) -> str:
-    """Detect spoken/typed language from content; locale is UI hint only."""
-    if re.search(r"[\u4e00-\u9fff]", text):
-        return "zh"
-    if re.search(r"[\u3040-\u30ff\u31f0-\u31ff]", text):
-        return "ja"
-    if locale:
-        base = locale.split("_")[0].split("-")[0].lower()
-        if base in {"zh", "ja", "ko"}:
-            return base
-    return "en"
-
-
-_REMIND_BEFORE_MINUTES = re.compile(
-    r"提前\s*([零一二三四五六七八九十两\d]+)\s*分钟|"
-    r"remind\s+me\s+(\d+)\s+minutes?\s+before",
-    re.IGNORECASE,
-)
-
-
-def _parse_reminder_offset_minutes(text: str) -> Optional[int]:
-    match = _REMIND_BEFORE_MINUTES.search(text)
-    if not match:
-        return None
-    raw = next(group for group in match.groups() if group)
-    raw = raw.strip()
-    if raw.isdigit():
-        return int(raw)
-    if raw == "十":
-        return 10
-    if raw.endswith("十") and len(raw) == 2 and raw[0] in "一二三四五六七八九两":
-        tens = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "两": 2}
-        return tens.get(raw[0], 0) * 10
-    digit_map = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "两": 2}
-    return digit_map.get(raw)
-
-
-def _scheduled_minutes_delta(before_iso: str, after_iso: str) -> Optional[int]:
-    from datetime import datetime
-
-    try:
-        before = datetime.fromisoformat(before_iso.replace("Z", "+00:00"))
-        after = datetime.fromisoformat(after_iso.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return int(round((after - before).total_seconds() / 60))
-
-
-def _looks_like_remind_before_create(
-    reschedule: CommandInterpretAction,
-    follow_up: CommandInterpretAction,
-) -> bool:
-    if follow_up.action_type != "createReminder" or not follow_up.create:
-        return False
-    if not reschedule.edit or not reschedule.edit.new_scheduled_at:
-        return False
-    create_at = follow_up.create.scheduled_at
-    if not create_at:
-        return False
-    delta = _scheduled_minutes_delta(create_at, reschedule.edit.new_scheduled_at)
-    return delta is not None and 0 < delta <= 180
-
-
-def _collapse_reschedule_remind_before_create(
-    actions: list[CommandInterpretAction],
-    user_text: Optional[str],
-) -> list[CommandInterpretAction]:
-    """Merge reschedule + spurious pre-reminder create into one reschedule with offset."""
-    if len(actions) < 2:
-        return actions
-    first, second = actions[0], actions[1]
-    if first.action_type != "rescheduleTask" or second.action_type != "createReminder":
-        return actions
-    if not first.edit or not first.edit.new_scheduled_at:
-        return actions
-
-    offset = _parse_reminder_offset_minutes(user_text or "")
-    has_anchor = _looks_like_remind_before_create(first, second)
-    if offset is None and has_anchor and second.create and second.create.scheduled_at:
-        offset = _scheduled_minutes_delta(second.create.scheduled_at, first.edit.new_scheduled_at)
-    if offset is None or offset <= 0:
-        return actions
-    if _parse_reminder_offset_minutes(user_text or "") is None and not has_anchor:
-        return actions
-
-    first.edit.reminder_offset_minutes = offset
-    logger.info(
-        "interpretWarnings collapsedRescheduleRemindBeforeCreate offsetMinutes=%s actions_before=%s",
-        offset,
-        len(actions),
-    )
-    return [first, *actions[2:]]
-
-
-def _finalize_reschedule_remind_before_actions(
-    actions: list[CommandInterpretAction],
-    user_text: Optional[str],
-) -> list[CommandInterpretAction]:
-    actions = _collapse_reschedule_remind_before_create(actions, user_text)
-    if not actions or actions[0].action_type != "rescheduleTask" or not actions[0].edit:
-        return actions
-
-    remind_before = _parse_reminder_offset_minutes(user_text or "")
-    if actions[0].edit.reminder_offset_minutes:
-        remind_before = actions[0].edit.reminder_offset_minutes
-    elif remind_before:
-        actions[0].edit.reminder_offset_minutes = remind_before
-
-    if remind_before is None or len(actions) == 1:
-        return actions
-
-    kept = [actions[0]]
-    for action in actions[1:]:
-        if action.action_type in ("createReminder", "unknown"):
-            continue
-        if action.action_type == "appendToTask":
-            append_text = action.edit.append_text if action.edit else None
-            if not append_text or not append_text.strip():
-                continue
-        kept.append(action)
-    if len(kept) < len(actions):
-        logger.info(
-            "interpretWarnings droppedFollowupsAfterRescheduleRemindBefore before=%s after=%s offsetMinutes=%s",
-            len(actions),
-            len(kept),
-            remind_before,
-        )
-    return kept
-
-
-def _drop_spurious_clarify_actions(actions: list[CommandInterpretAction]) -> list[CommandInterpretAction]:
-    """Remove extra unknown+clarify actions when a confident executable action exists."""
-    if len(actions) <= 1:
-        return actions
-    has_executable = any(
-        action.action_type not in (None, "unknown")
-        and not (action.requires_confirmation and action.confirmation_kind == "clarify")
-        for action in actions
-    )
-    if not has_executable:
-        return actions
-    pruned = [
-        action
-        for action in actions
-        if not (
-            action.action_type == "unknown"
-            and action.requires_confirmation
-            and action.confirmation_kind == "clarify"
-        )
-    ]
-    if pruned and len(pruned) < len(actions):
-        logger.info(
-            "interpretWarnings droppedSpuriousClarifyActions before=%s after=%s",
-            len(actions),
-            len(pruned),
-        )
-    return pruned or actions
-
-
 def _mirror_first_action_to_top_level(response: CommandInterpretResponse) -> None:
     if not response.actions:
         return
@@ -797,8 +606,8 @@ def _sanitize_interpret_response(
         response.actions = _expand_compound_interpret_action(sanitized_top)
 
     if response.actions:
-        response.actions = _drop_spurious_clarify_actions(response.actions)
-        response.actions = _finalize_reschedule_remind_before_actions(response.actions, user_text)
+        response.actions = drop_invalid_actions(response.actions)
+        response.actions = enforce_catalog_composition(response.actions)
 
     _mirror_first_action_to_top_level(response)
 
@@ -1067,21 +876,23 @@ async def interpret_command(
         "current_time": now,
         "timezone": timezone,
         "locale": locale,
-        "input_language": _infer_input_language(text, locale),
+        "input_language": infer_input_language(text, locale),
         "active_task": _slim_interpret_task(active_task),
         "candidate_tasks": [
             slim for task in candidate_tasks if (slim := _slim_interpret_task(task))
         ],
     }
     user_json = json.dumps(user_payload, ensure_ascii=False, separators=(",", ":"))
-    prompt_chars = len(COMMAND_INTERPRETER_PROMPT) + len(user_json)
+    system_prompt = build_interpreter_system_prompt()
+    prompt_chars = len(system_prompt) + len(user_json)
     prompt_build_ms = (time.perf_counter() - route_t0) * 1000
     logger.info(
-        "interpret promptBuilt request_id=%s promptBuildMs=%.1f promptChars=%s promptTokenEstimate=%s candidateTaskCount=%s slimmedCandidateCount=%s sendsFullHistory=false",
+        "interpret promptBuilt request_id=%s promptBuildMs=%.1f promptChars=%s promptTokenEstimate=%s catalogVersion=%s candidateTaskCount=%s slimmedCandidateCount=%s sendsFullHistory=false",
         request_id,
         prompt_build_ms,
         prompt_chars,
         estimate_tokens_from_chars(prompt_chars),
+        catalog_version(),
         len(candidate_tasks),
         len(user_payload["candidate_tasks"]),
     )
@@ -1090,7 +901,7 @@ async def interpret_command(
         "temperature": 0,
         "max_tokens": OPENAI_INTERPRET_MAX_TOKENS,
         "messages": [
-            {"role": "system", "content": COMMAND_INTERPRETER_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_json},
         ],
         "response_format": {"type": "json_object"},
